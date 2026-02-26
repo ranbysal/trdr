@@ -1,0 +1,15 @@
+{
+  "name": "futures-bot",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "postCreateCommand": "bash -lc 'python3 -m venv --system-site-packages .venv && . .venv/bin/activate && python -m pip install --upgrade pip setuptools wheel && (python -m pip install -r requirements-dev.txt || python -c \"import numpy, pandas, yaml, pytest\")'",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "python.defaultInterpreterPath": "${containerWorkspaceFolder}/.venv/bin/python"
+      }
+    }
+  }
+}

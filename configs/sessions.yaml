@@ -1,0 +1,6 @@
+version: 1
+timezone: America/New_York
+sessions:
+  regular:
+    start: "09:30"
+    end: "16:00"
