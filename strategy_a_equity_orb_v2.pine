@@ -1,0 +1,375 @@
+//@version=6
+strategy("Strategy A - Equity ORB (v2.0)", overlay=true, pyramiding=0, calc_on_every_tick=false, process_orders_on_close=true)
+
+string TZ = "America/New_York"
+int LOOKBACK_SESSIONS = 20
+int MIN_READY_SAMPLES = 5
+int NUM_1M_BUCKETS = 390
+int NUM_5M_BUCKETS = 78
+int RTH_START_MIN = 9 * 60 + 30
+
+root_symbol = input.string("NQ", "root_symbol", options=["NQ", "YM"])
+other_symbol = input.symbol("CBOT_MINI:YM1!", "other_symbol")
+risk_pct_input = input.float(0.30, "risk_pct", step=0.01, minval=0.01)
+one_trade_per_direction = input.bool(true, "one_trade_per_day_per_direction")
+
+is_1m_chart = timeframe.isminutes and timeframe.multiplier == 1
+
+f_bucket_insert(float[] hist, int[] counts, int[] ptrs, int bucket, int lookback, float val) =>
+    int base = bucket * lookback
+    int ptr = array.get(ptrs, bucket)
+    array.set(hist, base + ptr, val)
+    ptr := (ptr + 1) % lookback
+    array.set(ptrs, bucket, ptr)
+    int cnt = array.get(counts, bucket)
+    if cnt < lookback
+        array.set(counts, bucket, cnt + 1)
+
+f_bucket_median(float[] hist, int[] counts, int bucket, int lookback) =>
+    int cnt = array.get(counts, bucket)
+    if cnt <= 0
+        na
+    else
+        float[] tmp = array.new_float(0)
+        int base = bucket * lookback
+        for i = 0 to lookback - 1
+            float v = array.get(hist, base + i)
+            if not na(v)
+                array.push(tmp, v)
+        int n = array.size(tmp)
+        if n == 0
+            na
+        else
+            array.sort(tmp, order.ascending)
+            int mid = int(math.floor(n / 2))
+            n % 2 == 1 ? array.get(tmp, mid) : (array.get(tmp, mid - 1) + array.get(tmp, mid)) / 2.0
+
+f_bucket_pct_rank(float[] hist, int[] counts, int bucket, int lookback, float current) =>
+    int cnt = array.get(counts, bucket)
+    if cnt <= 0
+        na
+    else
+        int base = bucket * lookback
+        int seen = 0
+        int leq = 0
+        for i = 0 to lookback - 1
+            float v = array.get(hist, base + i)
+            if not na(v)
+                seen += 1
+                if v <= current
+                    leq += 1
+        seen > 0 ? (100.0 * leq) / seen : na
+
+f_er20(float src) =>
+    float net = math.abs(src - src[20])
+    float denom = ta.sum(math.abs(src - src[1]), 20)
+    denom > 0.0 ? net / denom : 0.0
+
+f_session_vwap_5m() =>
+    var float cum_pv = 0.0
+    var float cum_v = 0.0
+    int et_day = year(time, TZ) * 1000 + dayofyear(time, TZ)
+    bool new_day = ta.change(et_day) != 0
+    if new_day
+        cum_pv := 0.0
+        cum_v := 0.0
+    int mod = hour(time, TZ) * 60 + minute(time, TZ)
+    bool in_rth = mod >= RTH_START_MIN and mod < (16 * 60)
+    if in_rth
+        cum_pv += hlc3 * volume
+        cum_v += volume
+    cum_v > 0.0 ? cum_pv / cum_v : na
+
+f_regime_text(int regime) =>
+    regime == 1 ? "TREND" : regime == -1 ? "CHOP" : "NEUTRAL"
+
+int et_day = year(time, TZ) * 1000 + dayofyear(time, TZ)
+bool is_new_day = ta.change(et_day) != 0
+int et_mod = hour(time, TZ) * 60 + minute(time, TZ)
+int bucket_1m = et_mod - RTH_START_MIN
+int bucket_5m = int(math.floor(bucket_1m / 5))
+bool in_or_window = et_mod >= (9 * 60 + 30) and et_mod <= (9 * 60 + 45)
+bool in_entry_window = et_mod >= (9 * 60 + 30) and et_mod <= (10 * 60 + 45)
+bool after_force_flat = et_mod >= (11 * 60 + 30)
+bool in_rth_bucket = bucket_1m >= 0 and bucket_1m < NUM_1M_BUCKETS
+bool is_5m_close_bar = is_1m_chart and in_rth_bucket and (minute(time, TZ) % 5 == 4)
+
+var float or_high = na
+var float or_low = na
+var bool or_locked = false
+var bool traded_long_today = false
+var bool traded_short_today = false
+
+if is_new_day
+    or_high := na
+    or_low := na
+    or_locked := false
+    traded_long_today := false
+    traded_short_today := false
+
+if in_or_window
+    or_high := na(or_high) ? high : math.max(or_high, high)
+    or_low := na(or_low) ? low : math.min(or_low, low)
+
+if not in_or_window and in_or_window[1] and not na(or_high) and not na(or_low)
+    or_locked := true
+
+bool or_ready = or_locked
+float or_mid = (not na(or_high) and not na(or_low)) ? (or_high + or_low) / 2.0 : na
+float or_width = (not na(or_high) and not na(or_low)) ? (or_high - or_low) : na
+
+var float cum_pv_1m = 0.0
+var float cum_v_1m = 0.0
+if is_new_day
+    cum_pv_1m := 0.0
+    cum_v_1m := 0.0
+if in_rth_bucket
+    cum_pv_1m += hlc3 * volume
+    cum_v_1m += volume
+float session_vwap = cum_v_1m > 0.0 ? cum_pv_1m / cum_v_1m : na
+
+float ema9_1m = ta.ema(close, 9)
+
+float atr_14_5m = request.security(syminfo.tickerid, "5", ta.atr(14), barmerge.gaps_off, barmerge.lookahead_off)
+float ema9_5m = request.security(syminfo.tickerid, "5", ta.ema(close, 9), barmerge.gaps_off, barmerge.lookahead_off)
+float ema21_5m = request.security(syminfo.tickerid, "5", ta.ema(close, 21), barmerge.gaps_off, barmerge.lookahead_off)
+float ema20_5m = request.security(syminfo.tickerid, "5", ta.ema(close, 20), barmerge.gaps_off, barmerge.lookahead_off)
+float adx_14_5m = request.security(syminfo.tickerid, "5", ta.adx(14), barmerge.gaps_off, barmerge.lookahead_off)
+float er_20_5m = request.security(syminfo.tickerid, "5", f_er20(close), barmerge.gaps_off, barmerge.lookahead_off)
+float session_vwap_5m = request.security(syminfo.tickerid, "5", f_session_vwap_5m(), barmerge.gaps_off, barmerge.lookahead_off)
+float vol_5m = request.security(syminfo.tickerid, "5", volume, barmerge.gaps_off, barmerge.lookahead_off)
+_ = request.security(other_symbol, "5", close, barmerge.gaps_off, barmerge.lookahead_off)
+
+float vwap_slope_norm = (not na(session_vwap_5m[6]) and atr_14_5m > 0.0) ? (session_vwap_5m - session_vwap_5m[6]) / atr_14_5m : na
+
+var float[] vol1_hist = array.new_float(NUM_1M_BUCKETS * LOOKBACK_SESSIONS, na)
+var int[] vol1_count = array.new_int(NUM_1M_BUCKETS, 0)
+var int[] vol1_ptr = array.new_int(NUM_1M_BUCKETS, 0)
+var float[] vol5_hist = array.new_float(NUM_5M_BUCKETS * LOOKBACK_SESSIONS, na)
+var int[] vol5_count = array.new_int(NUM_5M_BUCKETS, 0)
+var int[] vol5_ptr = array.new_int(NUM_5M_BUCKETS, 0)
+var float[] atr5_hist = array.new_float(NUM_5M_BUCKETS * LOOKBACK_SESSIONS, na)
+var int[] atr5_count = array.new_int(NUM_5M_BUCKETS, 0)
+var int[] atr5_ptr = array.new_int(NUM_5M_BUCKETS, 0)
+
+float med_vol_1m = na
+bool rvol_1m_available = false
+float rvol_tod_1m = na
+if is_1m_chart and in_rth_bucket
+    med_vol_1m := f_bucket_median(vol1_hist, vol1_count, bucket_1m, LOOKBACK_SESSIONS)
+    int c1 = array.get(vol1_count, bucket_1m)
+    rvol_1m_available := c1 >= MIN_READY_SAMPLES and not na(med_vol_1m) and med_vol_1m > 0.0
+    rvol_tod_1m := rvol_1m_available ? (volume / med_vol_1m) : na
+    f_bucket_insert(vol1_hist, vol1_count, vol1_ptr, bucket_1m, LOOKBACK_SESSIONS, volume)
+
+bool vol_strong_1m = rvol_1m_available and rvol_tod_1m >= 1.15
+
+var float rvol5_last0 = na
+var float rvol5_last1 = na
+var float rvol5_last2 = na
+var float rvol_tod_5m = na
+var bool rvol_5m_available = false
+
+var float atr_pct_rank = na
+var bool atr_rank_available = false
+
+var int raw_regime = 0
+var int candidate_regime = 0
+var int candidate_streak = 0
+var int low_volume_trend_streak_5m = 0
+
+if is_5m_close_bar and bucket_5m >= 0 and bucket_5m < NUM_5M_BUCKETS
+    float med_vol_5m = f_bucket_median(vol5_hist, vol5_count, bucket_5m, LOOKBACK_SESSIONS)
+    int c5 = array.get(vol5_count, bucket_5m)
+    rvol_5m_available := c5 >= MIN_READY_SAMPLES and not na(med_vol_5m) and med_vol_5m > 0.0
+    rvol_tod_5m := rvol_5m_available ? (vol_5m / med_vol_5m) : na
+    f_bucket_insert(vol5_hist, vol5_count, vol5_ptr, bucket_5m, LOOKBACK_SESSIONS, vol_5m)
+
+    float rank_raw = na
+    int ca = array.get(atr5_count, bucket_5m)
+    atr_rank_available := ca >= MIN_READY_SAMPLES
+    if atr_rank_available
+        rank_raw := f_bucket_pct_rank(atr5_hist, atr5_count, bucket_5m, LOOKBACK_SESSIONS, atr_14_5m)
+    atr_pct_rank := rank_raw
+    f_bucket_insert(atr5_hist, atr5_count, atr5_ptr, bucket_5m, LOOKBACK_SESSIONS, atr_14_5m)
+
+    bool trend_candidate = not na(vwap_slope_norm) and atr_rank_available and adx_14_5m >= 22.0 and er_20_5m >= 0.35 and math.abs(vwap_slope_norm) >= 0.15 and atr_pct_rank >= 30.0 and atr_pct_rank <= 95.0
+    bool chop_candidate = not na(vwap_slope_norm) and atr_rank_available and adx_14_5m <= 18.0 and er_20_5m <= 0.25 and math.abs(vwap_slope_norm) <= 0.08 and atr_pct_rank >= 8.0 and atr_pct_rank <= 95.0
+    int next_candidate = trend_candidate ? 1 : chop_candidate ? -1 : 0
+
+    if next_candidate == candidate_regime
+        candidate_streak += 1
+    else
+        candidate_regime := next_candidate
+        candidate_streak := 1
+
+    if next_candidate != raw_regime and candidate_streak >= 2
+        raw_regime := next_candidate
+
+    if raw_regime == 1 and rvol_5m_available and rvol_tod_5m < 0.70
+        low_volume_trend_streak_5m += 1
+    else
+        low_volume_trend_streak_5m := 0
+
+    rvol5_last2 := rvol5_last1
+    rvol5_last1 := rvol5_last0
+    rvol5_last0 := rvol_tod_5m
+
+bool rvol3_5m_available = not na(rvol5_last0) and not na(rvol5_last1) and not na(rvol5_last2)
+float rvol_3bar_aggregate_5m = na
+if rvol3_5m_available
+    float a = rvol5_last0
+    float b = rvol5_last1
+    float c = rvol5_last2
+    float hi = math.max(a, math.max(b, c))
+    float lo = math.min(a, math.min(b, c))
+    rvol_3bar_aggregate_5m := a + b + c - hi - lo
+
+bool qualified_trend_for_breakout = raw_regime == 1 and (low_volume_trend_streak_5m < 3 or vol_strong_1m)
+
+bool long_ema_align = ema9_5m > ema21_5m
+bool short_ema_align = ema9_5m < ema21_5m
+
+bool width_ok = not na(or_width) and atr_14_5m > 0.0 and (or_width / atr_14_5m) >= 1.0 and (or_width / atr_14_5m) <= 4.5
+bool volume_gate = vol_strong_1m or (not na(rvol_3bar_aggregate_5m) and rvol_3bar_aggregate_5m >= 1.10)
+
+bool long_trigger = close > or_high
+bool short_trigger = close < or_low
+
+float tick_size = syminfo.mintick
+float point_value = syminfo.pointvalue
+
+float long_entry_stop = not na(or_high) ? (or_high + tick_size) : na
+float short_entry_stop = not na(or_low) ? (or_low - tick_size) : na
+
+float long_init_stop_hyp = (not na(long_entry_stop) and not na(or_mid) and atr_14_5m > 0.0) ? math.max(or_mid, long_entry_stop - 0.8 * atr_14_5m) : na
+float short_init_stop_hyp = (not na(short_entry_stop) and not na(or_mid) and atr_14_5m > 0.0) ? math.min(or_mid, short_entry_stop + 0.8 * atr_14_5m) : na
+
+float long_stop_dist = (not na(long_entry_stop) and not na(long_init_stop_hyp)) ? (long_entry_stop - long_init_stop_hyp) : na
+float short_stop_dist = (not na(short_entry_stop) and not na(short_init_stop_hyp)) ? (short_init_stop_hyp - short_entry_stop) : na
+
+float risk_frac = risk_pct_input / 100.0
+float long_rpc = not na(long_stop_dist) and long_stop_dist > 0 ? long_stop_dist * point_value : na
+float short_rpc = not na(short_stop_dist) and short_stop_dist > 0 ? short_stop_dist * point_value : na
+float risk_budget = strategy.equity * risk_frac
+float qty_long = not na(long_rpc) and long_rpc > 0 ? math.floor(risk_budget / long_rpc) : 0
+float qty_short = not na(short_rpc) and short_rpc > 0 ? math.floor(risk_budget / short_rpc) : 0
+
+bool qty_long_ok = qty_long >= 1
+bool qty_short_ok = qty_short >= 1
+
+bool direction_long_ok = (not one_trade_per_direction) or (not traded_long_today)
+bool direction_short_ok = (not one_trade_per_direction) or (not traded_short_today)
+
+bool common_pre = is_1m_chart and or_ready and in_entry_window and qualified_trend_for_breakout and volume_gate and width_ok and strategy.position_size == 0 and not after_force_flat
+bool long_pre = common_pre and long_trigger and close > session_vwap and long_ema_align and direction_long_ok and qty_long_ok
+bool short_pre = common_pre and short_trigger and close < session_vwap and short_ema_align and direction_short_ok and qty_short_ok
+
+if not long_pre
+    strategy.cancel("L")
+if not short_pre
+    strategy.cancel("S")
+
+if long_pre
+    strategy.entry("L", strategy.long, qty=qty_long, stop=long_entry_stop)
+if short_pre
+    strategy.entry("S", strategy.short, qty=qty_short, stop=short_entry_stop)
+
+if after_force_flat
+    strategy.cancel("L")
+    strategy.cancel("S")
+    if strategy.position_size > 0
+        strategy.close("L", comment="11:30 ET force flat")
+    if strategy.position_size < 0
+        strategy.close("S", comment="11:30 ET force flat")
+
+var float active_entry = na
+var float active_stop = na
+var float active_r = na
+var float active_tp1 = na
+var float active_tp2 = na
+var float active_tp3_stop = na
+var bool tp1_touched = false
+var bool trail_active = false
+
+bool new_long = strategy.position_size > 0 and strategy.position_size[1] <= 0
+bool new_short = strategy.position_size < 0 and strategy.position_size[1] >= 0
+bool flat_now = strategy.position_size == 0
+
+if new_long
+    traded_long_today := true
+    active_entry := strategy.position_avg_price
+    active_stop := math.max(or_mid, active_entry - 0.8 * atr_14_5m)
+    active_r := math.abs(active_entry - active_stop)
+    active_tp1 := active_entry + active_r
+    active_tp2 := active_entry + 2.0 * active_r
+    active_tp3_stop := active_stop
+    tp1_touched := false
+    trail_active := false
+
+if new_short
+    traded_short_today := true
+    active_entry := strategy.position_avg_price
+    active_stop := math.min(or_mid, active_entry + 0.8 * atr_14_5m)
+    active_r := math.abs(active_entry - active_stop)
+    active_tp1 := active_entry - active_r
+    active_tp2 := active_entry - 2.0 * active_r
+    active_tp3_stop := active_stop
+    tp1_touched := false
+    trail_active := false
+
+if strategy.position_size > 0 and not na(active_r) and active_r > 0
+    tp1_touched := tp1_touched or high >= active_tp1
+    if tp1_touched
+        active_stop := math.max(active_stop, active_entry + tick_size)
+    trail_active := trail_active or high >= active_tp2
+    if trail_active
+        active_tp3_stop := math.max(active_tp3_stop, ema9_1m)
+    active_tp3_stop := math.max(active_tp3_stop, active_stop)
+
+    strategy.exit("L-TP1", "L", limit=active_tp1, stop=active_stop, qty_percent=50)
+    strategy.exit("L-TP2", "L", limit=active_tp2, stop=active_stop, qty_percent=30)
+    strategy.exit("L-TP3", "L", stop=active_tp3_stop, qty_percent=20)
+
+if strategy.position_size < 0 and not na(active_r) and active_r > 0
+    tp1_touched := tp1_touched or low <= active_tp1
+    if tp1_touched
+        active_stop := math.min(active_stop, active_entry - tick_size)
+    trail_active := trail_active or low <= active_tp2
+    if trail_active
+        active_tp3_stop := math.min(active_tp3_stop, ema9_1m)
+    active_tp3_stop := math.min(active_tp3_stop, active_stop)
+
+    strategy.exit("S-TP1", "S", limit=active_tp1, stop=active_stop, qty_percent=50)
+    strategy.exit("S-TP2", "S", limit=active_tp2, stop=active_stop, qty_percent=30)
+    strategy.exit("S-TP3", "S", stop=active_tp3_stop, qty_percent=20)
+
+if flat_now and strategy.position_size[1] != 0
+    active_entry := na
+    active_stop := na
+    active_r := na
+    active_tp1 := na
+    active_tp2 := na
+    active_tp3_stop := na
+    tp1_touched := false
+    trail_active := false
+
+plot(or_high, "OR High", color=color.new(color.green, 0), linewidth=2)
+plot(or_low, "OR Low", color=color.new(color.red, 0), linewidth=2)
+plot(or_mid, "OR Midpoint", color=color.new(color.orange, 0), linewidth=1)
+plot(session_vwap, "SessionVWAP", color=color.new(color.blue, 0), linewidth=2)
+plot(ema9_1m, "EMA9 1m", color=color.new(color.yellow, 0), linewidth=1)
+
+plotshape(is_1m_chart and in_entry_window and ((long_trigger and not qty_long_ok) or (short_trigger and not qty_short_ok)), title="Qty<1", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.tiny, text="Q<1")
+
+var label status_lbl = na
+if not na(status_lbl)
+    label.delete(status_lbl)
+
+string status_txt = "Regime: " + f_regime_text(raw_regime) +
+ " | Qualified: " + (qualified_trend_for_breakout ? "true" : "false") +
+ " | RVOL1m: " + str.tostring(rvol_tod_1m, "#.##") +
+ " | RVOL5m3: " + str.tostring(rvol_3bar_aggregate_5m, "#.##") +
+ " | OR_ready: " + (or_ready ? "true" : "false")
+
+status_lbl := label.new(bar_index, high, status_txt, style=label.style_label_down, textcolor=color.white, color=color.new(color.black, 65), size=size.tiny)
