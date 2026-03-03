@@ -46,6 +46,7 @@ def test_single_leg_sizing_math() -> None:
     assert decision.contracts == 2
     assert decision.stop_ticks == 80
     assert round(decision.slippage_est_ticks, 2) == 4.20
+    assert round(decision.adjusted_risk_per_contract, 2) == 425.80
 
 
 def test_micro_routing_recompute_correctness() -> None:
@@ -67,3 +68,23 @@ def test_micro_routing_recompute_correctness() -> None:
     assert decision.routed_symbol == "MNQ"
     assert decision.contracts == 1
     assert decision.stop_ticks == 10
+
+
+def test_micro_routing_supports_ym_to_mym_when_mini_lt_one() -> None:
+    ym = _meta("YM", tick_size=1.0, tick_value=5.0, commission_rt=4.8, micro_equivalent="MYM")
+    mym = _meta("MYM", tick_size=1.0, tick_value=0.5, commission_rt=1.2, micro_equivalent="MYM")
+
+    req = SingleLegSizingRequest(
+        instrument=ym,
+        equity=10_000.0,
+        risk_pct=0.001,
+        entry_price=40_000.0,
+        stop_price=39_990.0,
+        atr_14_1m_price=10.0,
+    )
+
+    decision = size_with_micro_routing(req, instruments_by_symbol={"YM": ym, "MYM": mym})
+
+    assert decision.approved is True
+    assert decision.routed_symbol == "MYM"
+    assert decision.contracts == 1

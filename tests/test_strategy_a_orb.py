@@ -67,6 +67,7 @@ def test_long_trigger_and_entry_plan() -> None:
     assert out.entry_plan is not None
     assert out.entry_plan.entry_stop > 0.0
     assert out.entry_plan.stop_limit_chase_ticks == 4
+    assert out.entry_plan.initial_stop >= (out.entry_plan.entry_stop - 0.8 * 4.2)
 
 
 def test_short_trigger() -> None:
@@ -136,3 +137,55 @@ def test_time_window_rejection() -> None:
 
     assert out.approved is False
     assert out.reason_code == "OUTSIDE_ENTRY_WINDOW"
+
+
+def test_entry_plan_initial_stop_uses_or_midpoint_bounds() -> None:
+    engine = StrategyAORB()
+    day = datetime(2026, 1, 6, tzinfo=ET)
+    _build_or(engine, day=day, symbol="NQ")
+
+    trigger = _bar(day.replace(hour=10, minute=0), high=110.0, low=100.0, close=110.5, symbol="NQ")
+    out = engine.evaluate_breakout_candidate(bar=trigger, features=_features(atr_14_5m=4.0), tick_size=0.25)
+    assert out.approved
+    assert out.entry_plan is not None
+
+    # Pine parity: long stop is max(OR_midpoint, entry - 0.8*ATR)
+    state = engine.update_or_state(_bar(day.replace(hour=10, minute=1), high=111.0, low=109.0, close=110.0, symbol="NQ"))
+    assert state.or_midpoint is not None
+    expected = max(state.or_midpoint, out.entry_plan.entry_stop - (0.8 * 4.0))
+    assert out.entry_plan.initial_stop == expected
+
+
+def test_dynamic_exit_state_tp1_breakeven_and_tp3_trail() -> None:
+    engine = StrategyAORB()
+
+    state = engine.initialize_exit_state(
+        side=OrderSide.BUY,
+        fill_price=100.0,
+        or_midpoint=98.0,
+        atr_14_5m=4.0,
+        tick_size=0.25,
+    )
+    assert state.tp1_price == 102.0
+    assert state.tp2_price == 104.0
+    assert state.active_stop == 98.0
+
+    after_tp1 = engine.update_exit_state_for_bar(
+        state=state,
+        bar_high=102.1,
+        bar_low=99.8,
+        ema9_1m=100.5,
+        tick_size=0.25,
+    )
+    assert after_tp1.tp1_touched
+    assert after_tp1.active_stop >= 100.25
+
+    after_tp2 = engine.update_exit_state_for_bar(
+        state=after_tp1,
+        bar_high=104.2,
+        bar_low=100.8,
+        ema9_1m=101.2,
+        tick_size=0.25,
+    )
+    assert after_tp2.trail_active
+    assert after_tp2.tp3_stop >= 101.2

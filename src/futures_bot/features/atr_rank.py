@@ -27,6 +27,9 @@ def compute_atr_pct_rank(
     states: list[str] = []
     avail_flags: list[bool] = []
     partial_flags: list[bool] = []
+    atr_rank_ok_flags: list[bool] = []
+    low_volume_regime_flags: list[bool] = []
+    history_log_codes: list[str | None] = []
 
     for idx, row in df.iterrows():
         prior = df.loc[
@@ -41,8 +44,8 @@ def compute_atr_pct_rank(
         readiness = classify_sample_count(sample_count)
 
         current_atr = float(row[atr_col])
-        if sample_count > 0:
-            pct_rank = float(np.count_nonzero(prior.to_numpy() <= current_atr) / sample_count)
+        if sample_count >= 5:
+            pct_rank = float((np.count_nonzero(prior.to_numpy() <= current_atr) / sample_count) * 100.0)
         else:
             pct_rank = np.nan
 
@@ -51,6 +54,9 @@ def compute_atr_pct_rank(
         states.append(readiness.state)
         avail_flags.append(readiness.is_available)
         partial_flags.append(readiness.is_partial)
+        atr_rank_ok_flags.append(sample_count >= 5)
+        low_volume_regime_flags.append(sample_count < 5)
+        history_log_codes.append("INSUFFICIENT_HISTORY" if readiness.is_partial else None)
 
     return pd.DataFrame(
         {
@@ -59,6 +65,9 @@ def compute_atr_pct_rank(
             "readiness": pd.Series(states, index=df.index, dtype=str),
             "is_available": pd.Series(avail_flags, index=df.index, dtype=bool),
             "is_partial": pd.Series(partial_flags, index=df.index, dtype=bool),
+            "ATR_RANK_OK": pd.Series(atr_rank_ok_flags, index=df.index, dtype=bool),
+            "low_volume_regime": pd.Series(low_volume_regime_flags, index=df.index, dtype=bool),
+            "history_log_code": pd.Series(history_log_codes, index=df.index, dtype=object),
         },
         index=df.index,
     )

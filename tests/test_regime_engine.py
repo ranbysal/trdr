@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from futures_bot.core.enums import Family, Regime
-from futures_bot.regime.engine import RegimeEngine, classify_symbol_candidate
+from futures_bot.regime.engine import (
+    RegimeEngine,
+    build_qualified_trend_for_breakout_inputs,
+    classify_symbol_candidate,
+    qualified_trend_for_breakout,
+)
 from futures_bot.regime.models import RegimeEngineState, SymbolFeatureSnapshot, SymbolRegimeState
 
 
@@ -131,3 +136,44 @@ def test_low_volume_trend_streak_updates_without_downgrading_trend() -> None:
 
     assert fam_3.raw_regime is Regime.TREND
     assert fam_3.low_volume_trend_streak_5m == 0
+
+
+def test_qualified_trend_for_breakout_helper() -> None:
+    trend_ok = qualified_trend_for_breakout(
+        build_qualified_trend_for_breakout_inputs(
+            family_state=engine_state_for_trend(streak=2),
+            trigger_rvol_tod_1m=1.1,
+            trigger_vol_strong_1m=False,
+        )
+    )
+    trend_blocked = qualified_trend_for_breakout(
+        build_qualified_trend_for_breakout_inputs(
+            family_state=engine_state_for_trend(streak=3),
+            trigger_rvol_tod_1m=1.0,
+            trigger_vol_strong_1m=False,
+        )
+    )
+    trend_override = qualified_trend_for_breakout(
+        build_qualified_trend_for_breakout_inputs(
+            family_state=engine_state_for_trend(streak=3),
+            trigger_rvol_tod_1m=1.0,
+            trigger_vol_strong_1m=True,
+        )
+    )
+
+    assert trend_ok is True
+    assert trend_blocked is False
+    assert trend_override is True
+
+
+def engine_state_for_trend(*, streak: int):
+    from futures_bot.regime.models import FamilyRegimeState
+
+    return FamilyRegimeState(
+        family=Family.EQUITIES,
+        raw_regime=Regime.TREND,
+        confidence=1.0,
+        is_weak_neutral=False,
+        low_volume_trend_streak_5m=streak,
+        rvol_tod_5m=0.8,
+    )

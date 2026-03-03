@@ -8,11 +8,14 @@ from zoneinfo import ZoneInfo
 
 from futures_bot.core.enums import OrderSide, Regime, StrategyModule
 from futures_bot.core.types import Bar1m, SignalCandidate
+from futures_bot.regime.engine import qualified_trend_for_breakout
+from futures_bot.regime.models import QualifiedTrendInputs
 from futures_bot.strategies.strategy_a_models import (
     ORSessionState,
     StrategyAEntryPlan,
     StrategyAEvaluation,
     StrategyAFeatureSnapshot,
+    StrategyAPositionExitState,
 )
 
 ET = ZoneInfo("America/New_York")
@@ -55,6 +58,9 @@ class StrategyAORB:
         self._or_states[symbol] = state
         return state
 
+    def get_or_state(self, symbol: str) -> ORSessionState | None:
+        return self._or_states.get(symbol)
+
     def evaluate_breakout_candidate(
         self,
         *,
@@ -84,8 +90,13 @@ class StrategyAORB:
         if side is None:
             return _reject("NO_BREAKOUT_TRIGGER")
 
-        qualified_trend = features.raw_regime is Regime.TREND and (
-            features.low_volume_trend_streak_5m < 3 or features.vol_strong_1m
+        qualified_trend = qualified_trend_for_breakout(
+            QualifiedTrendInputs(
+                family_raw_regime=features.raw_regime,
+                low_volume_trend_streak_5m=features.low_volume_trend_streak_5m,
+                trigger_rvol_tod_1m=None,
+                trigger_vol_strong_1m=features.vol_strong_1m,
+            )
         )
         if not qualified_trend:
             return _reject("UNQUALIFIED_TREND")
@@ -161,13 +172,13 @@ class StrategyAORB:
         )
 
         if side is OrderSide.BUY:
-            initial_stop = min(or_state.or_midpoint, entry_stop - (0.8 * atr_14_5m))
+            initial_stop = max(or_state.or_midpoint, entry_stop - (0.8 * atr_14_5m))
             risk_r = entry_stop - initial_stop
             tp1 = entry_stop + risk_r
             tp2 = entry_stop + (2.0 * risk_r)
             breakeven_stop = entry_stop + tick_size
         else:
-            initial_stop = max(or_state.or_midpoint, entry_stop + (0.8 * atr_14_5m))
+            initial_stop = min(or_state.or_midpoint, entry_stop + (0.8 * atr_14_5m))
             risk_r = initial_stop - entry_stop
             tp1 = entry_stop - risk_r
             tp2 = entry_stop - (2.0 * risk_r)
@@ -193,9 +204,93 @@ class StrategyAORB:
             tp1_size_frac=0.5,
             tp2_size_frac=0.3,
             tp3_size_frac=0.2,
+            tp3_trail_activate_price=tp2,
+            tp3_initial_stop=initial_stop,
             tp3_trail_rule="trail remaining 20% on 1m EMA9 close rule",
             breakeven_stop_after_tp1=breakeven_stop,
             flatten_by=flatten_by,
+        )
+
+    def initialize_exit_state(
+        self,
+        *,
+        side: OrderSide,
+        fill_price: float,
+        or_midpoint: float,
+        atr_14_5m: float,
+        tick_size: float,
+    ) -> StrategyAPositionExitState:
+        """Initialize dynamic stop/TP state at the time position is opened."""
+        if side is OrderSide.BUY:
+            active_stop = max(or_midpoint, fill_price - (0.8 * atr_14_5m))
+            active_r = fill_price - active_stop
+            tp1 = fill_price + active_r
+            tp2 = fill_price + (2.0 * active_r)
+            tp3_stop = active_stop
+        else:
+            active_stop = min(or_midpoint, fill_price + (0.8 * atr_14_5m))
+            active_r = active_stop - fill_price
+            tp1 = fill_price - active_r
+            tp2 = fill_price - (2.0 * active_r)
+            tp3_stop = active_stop
+
+        if active_r <= 0.0:
+            raise ValueError("Invalid dynamic exit state: non-positive R")
+
+        return StrategyAPositionExitState(
+            side=side,
+            entry_price=fill_price,
+            active_stop=active_stop,
+            active_r=active_r,
+            tp1_price=tp1,
+            tp2_price=tp2,
+            tp3_stop=tp3_stop,
+            tp1_touched=False,
+            trail_active=False,
+        )
+
+    def update_exit_state_for_bar(
+        self,
+        *,
+        state: StrategyAPositionExitState,
+        bar_high: float,
+        bar_low: float,
+        ema9_1m: float,
+        tick_size: float,
+    ) -> StrategyAPositionExitState:
+        """Apply TP1 breakeven and TP3 EMA9 trailing transitions for one 1m bar."""
+        active_stop = state.active_stop
+        tp3_stop = state.tp3_stop
+        tp1_touched = state.tp1_touched
+        trail_active = state.trail_active
+
+        if state.side is OrderSide.BUY:
+            tp1_touched = tp1_touched or (bar_high >= state.tp1_price)
+            if tp1_touched:
+                active_stop = max(active_stop, state.entry_price + tick_size)
+            trail_active = trail_active or (bar_high >= state.tp2_price)
+            if trail_active:
+                tp3_stop = max(tp3_stop, ema9_1m)
+            tp3_stop = max(tp3_stop, active_stop)
+        else:
+            tp1_touched = tp1_touched or (bar_low <= state.tp1_price)
+            if tp1_touched:
+                active_stop = min(active_stop, state.entry_price - tick_size)
+            trail_active = trail_active or (bar_low <= state.tp2_price)
+            if trail_active:
+                tp3_stop = min(tp3_stop, ema9_1m)
+            tp3_stop = min(tp3_stop, active_stop)
+
+        return StrategyAPositionExitState(
+            side=state.side,
+            entry_price=state.entry_price,
+            active_stop=active_stop,
+            active_r=state.active_r,
+            tp1_price=state.tp1_price,
+            tp2_price=state.tp2_price,
+            tp3_stop=tp3_stop,
+            tp1_touched=tp1_touched,
+            trail_active=trail_active,
         )
 
 

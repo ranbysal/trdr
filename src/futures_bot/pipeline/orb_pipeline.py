@@ -43,6 +43,7 @@ class ORBFeatureSnapshot:
     vol_strong_1m: bool
     rvol_3bar_aggregate_5m: float | None
     exec_quality: float = 1.0
+    ema9_1m: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +93,9 @@ def run_strategy_a_orb_pipeline(
         now=bar.ts,
     ):
         return _reject("COOLDOWN_ACTIVE")
+
+    if risk_state.caps_manager.has_open_position(symbol=symbol):
+        return _reject("POSITION_ALREADY_OPEN")
 
     halt = risk_state.daily_halt_manager.can_open_new_entry()
     if not halt.approved:

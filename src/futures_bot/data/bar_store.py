@@ -44,6 +44,11 @@ class SymbolBarStore:
         if bar.symbol != self.symbol:
             raise IntegrityError(f"Bar symbol mismatch for store {self.symbol}: {bar.symbol}")
 
+        if bar.ts.second != 0 or bar.ts.microsecond != 0:
+            self.data_ok = False
+            self.logs.append(LogEvent(ts=bar.ts, code="BAR_TS_NOT_MINUTE_ALIGNED", symbol=self.symbol))
+            return BarIngestResult(accepted=False, ignored=False, overwritten=False, data_ok=self.data_ok)
+
         existing = self._bars.get(bar.ts)
         if existing is not None:
             return self._handle_duplicate(existing, bar, provisional)

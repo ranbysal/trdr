@@ -2,32 +2,22 @@
 
 from __future__ import annotations
 
+from futures_bot.policy import cro_policy
 from futures_bot.risk.models import SlippageEstimate
-
-_K_BY_SYMBOL: dict[str, float] = {
-    "NQ": 0.08,
-    "MNQ": 0.08,
-    "YM": 0.06,
-    "MYM": 0.06,
-    "MGC": 0.10,
-    "SIL": 0.15,
-}
-
-_BASE_TICKS_BY_SYMBOL: dict[str, float] = {
-    "SIL": 2.0,
-}
 
 
 def slippage_coeff_k(symbol: str) -> float:
     """Return instrument slippage coefficient `k` for CRO model."""
-    if symbol not in _K_BY_SYMBOL:
+    if symbol not in cro_policy.slippage_k_by_symbol:
         raise ValueError(f"Unsupported symbol for slippage model: {symbol}")
-    return _K_BY_SYMBOL[symbol]
+    return cro_policy.slippage_k_by_symbol[symbol]
 
 
 def slippage_base_ticks(symbol: str) -> float:
     """Return base slippage ticks for instrument."""
-    return _BASE_TICKS_BY_SYMBOL.get(symbol, 1.0)
+    if symbol not in cro_policy.slippage_base_ticks_by_symbol:
+        raise ValueError(f"Unsupported symbol for slippage model: {symbol}")
+    return cro_policy.slippage_base_ticks_by_symbol[symbol]
 
 
 def estimate_slippage_ticks(symbol: str, atr_14_1m_in_ticks: float) -> SlippageEstimate:

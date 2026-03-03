@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from futures_bot.policy import cro_policy
 from futures_bot.risk.models import CooldownState
 
 
@@ -13,8 +14,8 @@ class ConsecutiveLossCooldownManager:
     def __init__(
         self,
         *,
-        threshold_losses: int = 3,
-        cooldown_minutes: int = 30,
+        threshold_losses: int = cro_policy.cooldown_losses_trigger,
+        cooldown_minutes: int = cro_policy.cooldown_minutes,
     ) -> None:
         self._threshold_losses = threshold_losses
         self._cooldown_minutes = cooldown_minutes

@@ -1,16 +1,15 @@
-"""Data models for Strategy A (Equity ORB)."""
+"""Data models for Strategy C (Metals ORB)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from futures_bot.core.enums import OrderSide, Regime
-from futures_bot.core.types import SignalCandidate
+from futures_bot.core.enums import OrderSide
 
 
 @dataclass(frozen=True, slots=True)
-class ORSessionState:
+class MetalsORSessionState:
     symbol: str
     session_date: date
     or_high: float | None = None
@@ -32,52 +31,28 @@ class ORSessionState:
 
 
 @dataclass(frozen=True, slots=True)
-class StrategyAFeatureSnapshot:
-    raw_regime: Regime
-    low_volume_trend_streak_5m: int
+class StrategyCFeatureSnapshot:
+    session_vwap: float
+    ema20_5m_slope: float
+    atr_14_5m: float
     vol_strong_1m: bool
     rvol_3bar_aggregate_5m: float | None
-    session_vwap: float
-    ema9_5m: float
-    ema21_5m: float
-    atr_14_5m: float
     tier1_lockout_active: bool
 
 
 @dataclass(frozen=True, slots=True)
-class StrategyAEntryPlan:
+class StrategyCEntryPlan:
     side: OrderSide
     entry_stop: float
-    stop_limit_chase_ticks: int
     initial_stop: float
     tp1_price: float
     tp2_price: float
-    tp1_size_frac: float
-    tp2_size_frac: float
-    tp3_size_frac: float
-    tp3_trail_activate_price: float
-    tp3_initial_stop: float
-    tp3_trail_rule: str
-    breakeven_stop_after_tp1: float
     flatten_by: datetime
 
 
 @dataclass(frozen=True, slots=True)
-class StrategyAPositionExitState:
-    side: OrderSide
-    entry_price: float
-    active_stop: float
-    active_r: float
-    tp1_price: float
-    tp2_price: float
-    tp3_stop: float
-    tp1_touched: bool
-    trail_active: bool
-
-
-@dataclass(frozen=True, slots=True)
-class StrategyAEvaluation:
+class StrategyCEvaluation:
     approved: bool
     reason_code: str
-    signal: SignalCandidate | None
-    entry_plan: StrategyAEntryPlan | None
+    entry_plan: StrategyCEntryPlan | None
+

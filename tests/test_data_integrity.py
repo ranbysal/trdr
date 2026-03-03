@@ -65,3 +65,14 @@ def test_opening_gap_flag_does_not_force_data_bad() -> None:
 
     assert store.data_ok is True
     assert any(event.code == "GAP_FLAG" for event in store.logs)
+
+
+def test_rejects_non_minute_aligned_bar_timestamp() -> None:
+    ts = datetime(2026, 1, 5, 9, 30, 1, tzinfo=ET)
+    store = SymbolBarStore("ES")
+
+    result = store.ingest(_bar(ts), provisional=False, is_active_session=True)
+
+    assert result.accepted is False
+    assert store.data_ok is False
+    assert any(event.code == "BAR_TS_NOT_MINUTE_ALIGNED" for event in store.logs)

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from futures_bot.core.enums import Family
+from futures_bot.policy import cro_policy
 
 ET = ZoneInfo("America/New_York")
 
@@ -59,9 +60,11 @@ class CalendarStore:
             if not _event_applies(event=event, family=family, symbol=symbol):
                 continue
 
-            lockout_start = event.ts_et - timedelta(minutes=15)
-            lockout_end = event.ts_et + timedelta(minutes=20)
-            cancel_resting_entries_at = event.ts_et - timedelta(minutes=2)
+            lockout_start = event.ts_et - timedelta(minutes=cro_policy.tier1_lockout_pre_minutes)
+            lockout_end = event.ts_et + timedelta(minutes=cro_policy.tier1_lockout_post_minutes)
+            cancel_resting_entries_at = event.ts_et - timedelta(
+                minutes=cro_policy.tier1_cancel_resting_entries_pre_minutes
+            )
 
             if lockout_start <= ts <= lockout_end:
                 locked = True

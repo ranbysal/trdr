@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from futures_bot.policy import cro_policy
 from futures_bot.risk.models import RiskDecision
 
 
 class DailyHaltManager:
     """Halts new entries when realized session loss exceeds threshold."""
 
-    def __init__(self, *, realized_loss_halt_pct: float = 0.015) -> None:
+    def __init__(self, *, realized_loss_halt_pct: float = cro_policy.daily_loss_limit) -> None:
         self._realized_loss_halt_pct = realized_loss_halt_pct
         self._session_start_equity: float | None = None
         self._realized_pnl: float = 0.0

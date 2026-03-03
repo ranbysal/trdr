@@ -50,6 +50,13 @@ def build_qualified_trend_for_breakout_inputs(
     )
 
 
+def qualified_trend_for_breakout(inputs: QualifiedTrendInputs) -> bool:
+    """Return True when TREND is qualified for 1m breakout entries."""
+    return inputs.family_raw_regime is Regime.TREND and (
+        inputs.low_volume_trend_streak_5m < 3 or inputs.trigger_vol_strong_1m
+    )
+
+
 class RegimeEngine:
     """Deterministic 5m regime engine without strategy entry logic."""
 

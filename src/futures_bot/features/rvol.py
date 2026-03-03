@@ -36,6 +36,8 @@ def compute_rvol_tod(
     states: list[str] = []
     avail_flags: list[bool] = []
     partial_flags: list[bool] = []
+    vol_ok_flags: list[bool] = []
+    history_log_codes: list[str | None] = []
 
     for idx, row in df.iterrows():
         prior = df.loc[
@@ -55,6 +57,8 @@ def compute_rvol_tod(
         states.append(readiness.state)
         avail_flags.append(readiness.is_available)
         partial_flags.append(readiness.is_partial)
+        vol_ok_flags.append(readiness.is_available)
+        history_log_codes.append("INSUFFICIENT_HISTORY" if readiness.is_partial else None)
 
     col_prefix = "RVOL_TOD_1m" if timeframe == "1m" else "RVOL_TOD_5m"
     threshold = VOL_STRONG_THRESHOLD_1M if timeframe == "1m" else VOL_STRONG_THRESHOLD_5M
@@ -68,6 +72,8 @@ def compute_rvol_tod(
             "readiness": pd.Series(states, index=df.index, dtype=str),
             "is_available": pd.Series(avail_flags, index=df.index, dtype=bool),
             "is_partial": pd.Series(partial_flags, index=df.index, dtype=bool),
+            "VOL_OK": pd.Series(vol_ok_flags, index=df.index, dtype=bool),
+            "history_log_code": pd.Series(history_log_codes, index=df.index, dtype=object),
             "VOL_STRONG": rvol_series >= threshold,
         },
         index=df.index,

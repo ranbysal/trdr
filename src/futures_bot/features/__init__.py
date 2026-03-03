@@ -1,6 +1,7 @@
 """Feature calculation layer shared by all strategies."""
 
 from futures_bot.features.atr_rank import compute_atr_pct_rank
+from futures_bot.features.data_quality import evaluate_bar_timing, evaluate_quote_health, is_minute_aligned
 from futures_bot.features.history_readiness import Readiness, classify_sample_count
 from futures_bot.features.indicators_1m import compute_indicators_1m
 from futures_bot.features.indicators_5m import compute_indicators_5m
@@ -14,6 +15,9 @@ __all__ = [
     "compute_indicators_1m",
     "compute_indicators_5m",
     "compute_rvol_tod",
+    "evaluate_bar_timing",
+    "evaluate_quote_health",
+    "is_minute_aligned",
     "compute_session_vwap_1m",
     "median_rvol_3bar",
     "session_start_time",

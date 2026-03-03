@@ -37,7 +37,7 @@ def size_single_leg(request: SingleLegSizingRequest) -> SizingDecision:
     atr_ticks = float(request.atr_14_1m_price / request.instrument.tick_size)
     slip = estimate_slippage_ticks(request.instrument.symbol, atr_ticks)
 
-    risk_per_contract = float(stop_ticks * request.instrument.tick_value)
+    risk_per_contract = float(abs(request.entry_price - request.stop_price) * request.instrument.point_value)
     adjusted = risk_per_contract + (slip.slippage_est_ticks * request.instrument.tick_value) + request.instrument.commission_rt
 
     if adjusted <= 0.0:

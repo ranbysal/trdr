@@ -5,6 +5,7 @@ from futures_bot.regime.engine import (
     RegimeEngine,
     build_qualified_trend_for_breakout_inputs,
     classify_symbol_candidate,
+    qualified_trend_for_breakout,
 )
 from futures_bot.regime.models import (
     FamilyRegimeState,
@@ -24,4 +25,5 @@ __all__ = [
     "SymbolRegimeState",
     "build_qualified_trend_for_breakout_inputs",
     "classify_symbol_candidate",
+    "qualified_trend_for_breakout",
 ]

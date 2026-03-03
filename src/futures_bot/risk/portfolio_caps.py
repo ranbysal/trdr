@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 
 from futures_bot.core.enums import Family
+from futures_bot.policy import cro_policy
 from futures_bot.risk.models import OpenRiskEntry, RiskDecision
 
 
@@ -15,9 +16,9 @@ class PortfolioCapsManager:
         self,
         *,
         equity: float,
-        family_max_open_risk_pct: float = 0.0075,
-        total_max_open_risk_pct: float = 0.0120,
-        max_positions_per_symbol: int = 1,
+        family_max_open_risk_pct: float = cro_policy.family_open_risk_cap,
+        total_max_open_risk_pct: float = cro_policy.total_open_risk_cap,
+        max_positions_per_symbol: int = cro_policy.max_positions_per_symbol,
     ) -> None:
         self._equity = float(equity)
         self._family_max_open_risk_pct = family_max_open_risk_pct
@@ -58,3 +59,6 @@ class PortfolioCapsManager:
             if entry.symbol == symbol:
                 del self._open_entries[idx]
                 break
+
+    def has_open_position(self, *, symbol: str) -> bool:
+        return any(entry.symbol == symbol for entry in self._open_entries)

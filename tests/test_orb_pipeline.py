@@ -210,3 +210,37 @@ def test_pipeline_rejection_on_caps() -> None:
 
     assert out.approved is False
     assert out.reason_code == "FAMILY_OPEN_RISK_CAP"
+
+
+def test_pipeline_rejection_when_position_already_open() -> None:
+    strategy = StrategyAORB()
+    day = datetime(2026, 1, 7, tzinfo=ET)
+    _build_or(strategy, day=day)
+
+    risk = _risk_state()
+    risk.caps_manager.record_open_position(family=Family.EQUITIES, symbol="NQ", risk_dollars=300.0)
+
+    out = run_strategy_a_orb_pipeline(
+        strategy=strategy,
+        symbol_snapshot=ORBSymbolSnapshot(
+            bar_1m=_bar(day.replace(hour=10, minute=0), close=104.6),
+            instrument=_instrument("NQ", "MNQ"),
+            atr_14_1m_price=2.0,
+        ),
+        feature_snapshot=ORBFeatureSnapshot(
+            session_vwap=100.0,
+            ema9_5m=106.0,
+            ema21_5m=103.0,
+            atr_14_5m=4.0,
+            vol_strong_1m=True,
+            rvol_3bar_aggregate_5m=1.2,
+        ),
+        family_regime_state=FamilyRegimeState(
+            family=Family.EQUITIES, raw_regime=Regime.TREND, confidence=1.0, is_weak_neutral=False
+        ),
+        lockout_state=LockoutStatus(is_locked_out=False, cancel_resting_entries=False),
+        risk_state=risk,
+    )
+
+    assert out.approved is False
+    assert out.reason_code == "POSITION_ALREADY_OPEN"
