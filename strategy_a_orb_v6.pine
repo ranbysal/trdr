@@ -1,0 +1,443 @@
+// © ranbysal
+
+//@version=6
+strategy(
+     title                  = "Strategy A │ NQ ORB v6",
+     shorttitle             = "NQ-ORB",
+     overlay                = true,
+     default_qty_type       = strategy.fixed,
+     default_qty_value      = 1,
+     initial_capital        = 100000,
+     currency               = currency.USD,
+     commission_type        = strategy.commission.cash_per_contract,
+     commission_value       = 2.05,     // ~NQ round-turn commission
+     slippage               = 1,        // 1 tick model slippage
+     calc_on_every_tick     = false,    // fire only at bar close → no tick repaint
+     process_orders_on_close = false)   // realistic OHLC order fill model
+
+
+// ════════════════════════════════════════════════════════════════
+// § 1  INPUTS
+// ════════════════════════════════════════════════════════════════
+float i_tickSz   = input.float(0.25, "Tick Size ($)",           step=0.25, group="⚙️  Instrument")
+float i_tickVal  = input.float(5.00, "Tick Value ($)",           step=0.50, group="⚙️  Instrument")
+float i_riskPct  = input.float(0.30, "Risk % of Equity per Trade", step=0.01, minval=0.01, maxval=5.0, group="💰  Risk") / 100.0
+float i_adxMin   = input.float(22.0, "5m ADX Threshold",        step=0.5,  group="🔬  Regime Filters")
+float i_erMin    = input.float(0.35, "5m Kaufman ER Threshold",  step=0.01, group="🔬  Regime Filters")
+float i_orWMin   = input.float(1.0,  "OR Width Min (× 5m ATR)", step=0.1,  group="🔬  Regime Filters")
+float i_orWMax   = input.float(4.5,  "OR Width Max (× 5m ATR)", step=0.1,  group="🔬  Regime Filters")
+bool  i_showBox  = input.bool (true,  "Show OR Box",              group="🎨  Visuals")
+bool  i_showVWAP = input.bool (true,  "Show Session VWAP",        group="🎨  Visuals")
+bool  i_showInfo = input.bool (true,  "Show Info Table",          group="🎨  Visuals")
+
+
+// ════════════════════════════════════════════════════════════════
+// § 2  TIME WINDOWS  (all in America/New_York)
+// ════════════════════════════════════════════════════════════════
+string TZ = "America/New_York"
+
+int  etHH = hour  (time, TZ)
+int  etMM = minute(time, TZ)
+
+// Session strings use bars whose *open* time falls within the range.
+// On a 1m chart "0930-0945" captures bars opening at 09:30…09:44 → 15 bars.
+bool inOR      = not na(time("1", "0930-0945", TZ))   // OR construction window
+bool inEntry   = not na(time("1", "0930-1045", TZ))   // valid entry window
+
+// New-session pulse: first bar where OR window is active
+bool newSession = inOR and not inOR[1]
+
+// Hard flatten: rising edge at 11:30 ET (fires exactly once per day)
+bool pastFlat   = (etHH == 11 and etMM >= 30) or etHH > 11
+bool flattenBar = pastFlat and not pastFlat[1]
+
+
+// ════════════════════════════════════════════════════════════════
+// § 3  1-MINUTE INDICATORS
+// ════════════════════════════════════════════════════════════════
+float vwap1m   = ta.vwap(hlc3)          // session VWAP — resets at NYSE open
+float ema9_1m  = ta.ema(close, 9)
+float atr14_1m = ta.atr(14)
+
+
+// ════════════════════════════════════════════════════════════════
+// § 4  5-MINUTE MTF INDICATORS — NO REPAINT
+//      All calcs bundled in one request.security() call.
+//      lookahead_off → we only see the last *completed* 5m bar.
+// ════════════════════════════════════════════════════════════════
+f_5m() =>
+    float _ema9   = ta.ema(close, 9)
+    float _ema21  = ta.ema(close, 21)
+    float _atr    = ta.atr(14)
+    // Kaufman Efficiency Ratio (20)
+    float _dir    = math.abs(close - close[20])
+    float _noise  = math.sum(math.abs(close - close[1]), 20)
+    float _er     = _noise > 0 ? _dir / _noise : 0.0
+    // ADX via Pine's built-in DMI; we only need the adx component
+    [_dip, _dim, _adx] = ta.dmi(14, 14)
+    [_ema9, _ema21, _atr, _er, _adx]
+
+[ema9_5m, ema21_5m, atr14_5m, er_5m, adx_5m] =
+     request.security(syminfo.tickerid, "5", f_5m(),
+     lookahead = barmerge.lookahead_off)
+
+
+// ════════════════════════════════════════════════════════════════
+// § 5  OPENING RANGE CONSTRUCTION
+//      Accumulate 1m H/L during 09:30–09:44; lock at 09:45.
+// ════════════════════════════════════════════════════════════════
+var float orH        = na
+var float orL        = na
+var float orMid      = na
+var bool  orLocked   = false
+var bool  orValid    = false
+var int   orBarStart = na      // bar_index of session open (for box left edge)
+var box   orBox      = na
+var bool  orBoxDrawn = false
+
+// ── Reset at the start of every new session
+if newSession
+    orH        := na
+    orL        := na
+    orMid      := na
+    orLocked   := false
+    orValid    := false
+    orBarStart := bar_index
+    orBoxDrawn := false
+    if not na(orBox)
+        box.delete(orBox)
+    orBox := na
+
+// ── Grow OR while inside the OR window
+if inOR
+    orH := na(orH) ? high : math.max(orH, high)
+    orL := na(orL) ? low  : math.min(orL, low)
+
+// ── Lock on the first bar *after* the OR window closes
+if not inOR and not orLocked and not na(orH) and not na(orL)
+    orLocked := true
+    orMid    := (orH + orL) / 2.0
+    // OR Width Sanity: must be between 1.0× and 4.5× the 5m ATR(14)
+    if not na(atr14_5m) and atr14_5m > 0
+        float ratio = (orH - orL) / atr14_5m
+        orValid := ratio >= i_orWMin and ratio <= i_orWMax
+    else
+        orValid := false
+
+// ── Draw OR box (once per session, extended bar-by-bar through entry window)
+if i_showBox and orLocked and not orBoxDrawn
+    orBox      := box.new(
+         left         = orBarStart,
+         top          = orH,
+         right        = bar_index + 90,
+         bottom       = orL,
+         border_color = color.new(color.white, 15),
+         border_width  = 1,
+         bgcolor       = color.new(color.white, 88))
+    orBoxDrawn := true
+
+if i_showBox and not na(orBox) and inEntry
+    box.set_right(orBox, bar_index + 2)
+
+// ── OR-lock label (drawn once when OR just locked)
+if orLocked and not orLocked[1] and not na(orH) and not na(orL)
+    float orW   = orH - orL
+    float ratio = not na(atr14_5m) and atr14_5m > 0 ? orW / atr14_5m : 0.0
+    label.new(bar_index, orH,
+         text      = str.format("OR {0} pts | {1}×ATR | {2}",
+                                 str.tostring(orW,  "#.##"),
+                                 str.tostring(ratio,"#.##"),
+                                 orValid ? "✅ VALID" : "❌ INVALID"),
+         style     = label.style_label_down,
+         color     = orValid ? color.new(color.teal,  20) : color.new(color.red, 20),
+         textcolor = color.white,
+         size      = size.small)
+
+
+// ════════════════════════════════════════════════════════════════
+// § 6  PRECONDITIONS
+// ════════════════════════════════════════════════════════════════
+bool regimeOK    = not na(adx_5m) and not na(er_5m) and
+                   adx_5m >= i_adxMin and er_5m >= i_erMin
+
+bool longPrecon  = orLocked and orValid and regimeOK and inEntry and
+                   not na(ema9_5m) and not na(ema21_5m) and
+                   ema9_5m > ema21_5m and           // 5m trend up
+                   close > vwap1m                   // above session VWAP
+
+bool shortPrecon = orLocked and orValid and regimeOK and inEntry and
+                   not na(ema9_5m) and not na(ema21_5m) and
+                   ema9_5m < ema21_5m and           // 5m trend down
+                   close < vwap1m                   // below session VWAP
+
+
+// ════════════════════════════════════════════════════════════════
+// § 7  POSITION SIZING
+//      Accounts for slippage modifier per the CRO Vault spec.
+//      Returns integer contract count (min 1).
+// ════════════════════════════════════════════════════════════════
+calcQty(float entryPx, float stopPx) =>
+    // Slippage modifier: grows with intraday volatility
+    float slipTks  = 1.0 + 0.08 * (atr14_1m / syminfo.mintick)
+    float stopDist = math.abs(entryPx - stopPx)
+    // Convert stop distance to ticks, add slippage ticks
+    float stopTks  = stopDist / i_tickSz + slipTks
+    // Dollar risk this trade
+    float riskAmt  = strategy.equity * i_riskPct
+    // Risk per contract in dollars
+    float rpcDollar = stopTks * i_tickVal
+    int   qty       = rpcDollar > 0 ? math.max(1, math.floor(riskAmt / rpcDollar)) : 1
+    qty
+
+
+// ════════════════════════════════════════════════════════════════
+// § 8  TRADE STATE VARIABLES
+// ════════════════════════════════════════════════════════════════
+var bool  armed      = false   // TRUE once entry order placed this session
+var int   dir0       = 0       // +1 long / -1 short
+var float ent0       = na      // anticipated entry price (stop order price)
+var float sl0        = na      // initial stop-loss price
+var float tp1Px      = na      // TP1 price (+1R)
+var float tp2Px      = na      // TP2 price (+2R)
+var float bePx       = na      // breakeven price (entry ± 1 tick)
+var int   qty0       = 0       // total contracts entered
+var int   qty1       = 0       // TP1 contracts  (~50%)
+var int   qty2       = 0       // TP2 contracts  (~30%)
+var bool  tp1Hit     = false
+var bool  tp2Hit     = false
+var int   prevClosed = 0       // closed-trade counter snapshot for delta detection
+
+// ── Full state reset at session open
+if newSession
+    armed    := false
+    tp1Hit   := false
+    tp2Hit   := false
+    dir0     := 0
+    qty0     := 0
+    prevClosed := strategy.closedtrades
+
+
+// ════════════════════════════════════════════════════════════════
+// § 9  ORDER MANAGEMENT
+// ════════════════════════════════════════════════════════════════
+
+// ── A. PLACE ENTRY ORDERS  ───────────────────────────────────────
+//      Fires *once* per session on the first bar where preconditions
+//      are met and no position is open.
+// ────────────────────────────────────────────────────────────────
+bool noPos = strategy.position_size == 0
+
+if not armed and noPos and (longPrecon or shortPrecon)
+
+    // Long setup ─────────────────────────────────────────────────
+    if longPrecon
+        ent0  := orH + i_tickSz                                         // entry stop
+        sl0   := math.max(orMid, ent0 - 0.8 * atr14_5m) - i_tickSz    // initial SL
+        float r = math.abs(ent0 - sl0)                                  // 1R
+        tp1Px := ent0 + 1.0 * r
+        tp2Px := ent0 + 2.0 * r
+        bePx  := ent0 + i_tickSz                                        // BE + 1 tick
+        qty0  := calcQty(ent0, sl0)
+        qty1  := math.max(1, math.round(qty0 * 0.50))                  // 50%
+        qty2  := math.max(1, math.round(qty0 * 0.30))                  // 30%
+        dir0  := 1
+
+        strategy.entry("Long",  strategy.long,  qty=qty0, stop=ent0, comment="ORB↑")
+        // Partial exits — qty is absolute contracts so pct math stays clean
+        strategy.exit("TP1_L", from_entry="Long", qty=qty1, limit=tp1Px, comment="TP1")
+        strategy.exit("TP2_L", from_entry="Long", qty=qty2, limit=tp2Px, comment="TP2")
+        strategy.exit("SL_L",  from_entry="Long",           stop=sl0,    comment="SL")
+
+    // Short setup ────────────────────────────────────────────────
+    else if shortPrecon
+        ent0  := orL - i_tickSz
+        sl0   := math.min(orMid, ent0 + 0.8 * atr14_5m) + i_tickSz
+        float r = math.abs(ent0 - sl0)
+        tp1Px := ent0 - 1.0 * r
+        tp2Px := ent0 - 2.0 * r
+        bePx  := ent0 - i_tickSz
+        qty0  := calcQty(ent0, sl0)
+        qty1  := math.max(1, math.round(qty0 * 0.50))
+        qty2  := math.max(1, math.round(qty0 * 0.30))
+        dir0  := -1
+
+        strategy.entry("Short", strategy.short, qty=qty0, stop=ent0, comment="ORB↓")
+        strategy.exit("TP1_S", from_entry="Short", qty=qty1, limit=tp1Px, comment="TP1")
+        strategy.exit("TP2_S", from_entry="Short", qty=qty2, limit=tp2Px, comment="TP2")
+        strategy.exit("SL_S",  from_entry="Short",           stop=sl0,    comment="SL")
+
+    armed  := true
+    tp1Hit := false
+    tp2Hit := false
+
+
+// ── B. CANCEL UNFILLED ENTRY when entry window closes ───────────
+if armed and noPos and not inEntry
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+    armed := false
+
+
+// ── C. TP1 / TP2 DETECTION → update stop + activate TP3 ────────
+//      We detect exit fills by comparing strategy.closedtrades
+//      to our session snapshot (prevClosed).
+//      strategy.closedtrades.exit_id() identifies which TP fired.
+// ────────────────────────────────────────────────────────────────
+int  nClosed    = strategy.closedtrades
+bool newExitBar = nClosed > prevClosed
+
+if newExitBar and nClosed > 0
+    string lastId = strategy.closedtrades.exit_id(nClosed - 1)
+
+    // TP1 confirmed ──────────────────────────────────────────────
+    if not tp1Hit and (lastId == "TP1_L" or lastId == "TP1_S")
+        tp1Hit := true
+        // Re-issue SL exit at Breakeven + 1 tick (same ID → updates existing order)
+        if dir0 == 1
+            strategy.exit("SL_L", from_entry="Long",  stop=bePx, comment="BE↑")
+        else
+            strategy.exit("SL_S", from_entry="Short", stop=bePx, comment="BE↓")
+
+    // TP2 confirmed ──────────────────────────────────────────────
+    if tp1Hit and not tp2Hit and (lastId == "TP2_L" or lastId == "TP2_S")
+        tp2Hit := true
+        // Remaining ~20% is now managed purely by EMA9 trailing logic (§D below)
+
+prevClosed := nClosed
+
+
+// ── D. TP3  —  EMA9 TRAILING CLOSE ─────────────────────────────
+//      Active only after TP2 is confirmed.
+//      Long: close if 1m bar closes below 1m EMA9.
+//      Short: close if 1m bar closes above 1m EMA9.
+// ────────────────────────────────────────────────────────────────
+if tp2Hit and strategy.position_size != 0
+    if dir0 == 1 and close < ema9_1m
+        strategy.close("Long",  comment="TP3 EMA9↓")
+    if dir0 == -1 and close > ema9_1m
+        strategy.close("Short", comment="TP3 EMA9↑")
+
+
+// ── E. HARD TIME STOP  —  11:30 ET ─────────────────────────────
+if flattenBar
+    strategy.close_all(comment="⏱ Flatten 11:30")
+    strategy.cancel_all()
+    armed := false
+
+
+// ════════════════════════════════════════════════════════════════
+// § 10  VISUAL PLOTS
+// ════════════════════════════════════════════════════════════════
+
+// ── Session VWAP
+plot(i_showVWAP ? vwap1m : na,
+     title="Session VWAP", color=color.new(#00E5FF, 0), linewidth=1)
+
+// ── 1m EMA9  (fast, thin, yellow)
+plot(ema9_1m, title="1m EMA9", color=color.new(color.yellow, 0), linewidth=1)
+
+// ── 5m EMAs displayed on 1m chart  (bolder)
+plot(ema9_5m,  title="5m EMA9",  color=color.new(#64FF72, 10), linewidth=2)
+plot(ema21_5m, title="5m EMA21", color=color.new(#FF9800, 10), linewidth=2)
+
+// ── OR Mid-line
+plot(orLocked ? orMid : na,
+     title="OR Mid", color=color.new(color.silver, 30), linewidth=1,
+     style=plot.style_line)
+
+// ── Active trade levels  (visible while in a trade)
+bool inTrade = strategy.position_size != 0
+plot(inTrade ? sl0   : na, title="Active SL", color=color.new(color.red,    0), linewidth=1, style=plot.style_linebr)
+plot(inTrade ? tp1Px : na, title="TP1",       color=color.new(#69F0AE,     40), linewidth=1, style=plot.style_linebr)
+plot(inTrade ? tp2Px : na, title="TP2",       color=color.new(#69F0AE,      0), linewidth=2, style=plot.style_linebr)
+
+// ── Entry-level markers (shown once per session when first qualifying)
+plotshape(longPrecon  and not longPrecon [1] and not armed and not na(orH)
+          ? orH + i_tickSz : na,
+     title="Long Entry Signal",  style=shape.triangleup,
+     location=location.absolute, color=color.lime, size=size.small)
+
+plotshape(shortPrecon and not shortPrecon[1] and not armed and not na(orL)
+          ? orL - i_tickSz : na,
+     title="Short Entry Signal", style=shape.triangledown,
+     location=location.absolute, color=color.red,  size=size.small)
+
+// ── Window backgrounds
+bgcolor(inOR                    ? color.new(color.orange, 90) : na, title="OR Window  (yellow)")
+bgcolor(inEntry and not inOR    ? color.new(color.blue,   93) : na, title="Entry Window (blue)")
+
+
+// ════════════════════════════════════════════════════════════════
+// § 11  INFO TABLE  (top-right, updates on last bar of each bar)
+// ════════════════════════════════════════════════════════════════
+var table tbl = table.new(
+     position      = position.top_right,
+     columns       = 2,
+     rows          = 9,
+     bgcolor       = color.new(color.black, 55),
+     border_color  = color.new(color.gray,  40),
+     border_width  = 1,
+     frame_color   = color.new(color.gray,  40),
+     frame_width   = 1)
+
+// Helper to set a row
+_row(int r, string label, string val, color vc) =>
+    table.cell(tbl, 0, r, label, text_color=color.new(color.silver, 20),
+               text_size=size.small, bgcolor=color.new(color.black, 60))
+    table.cell(tbl, 1, r, val,   text_color=vc,
+               text_size=size.small, bgcolor=color.new(color.black, 55))
+
+if i_showInfo
+    // Header
+    table.cell(tbl, 0, 0, "NQ ORB v6",  text_color=color.white,
+               text_size=size.small, bgcolor=color.new(#1565C0, 20))
+    table.cell(tbl, 1, 0, "Status",     text_color=color.white,
+               text_size=size.small, bgcolor=color.new(#1565C0, 20))
+
+    // 5m ADX
+    color adxCol = not na(adx_5m) and adx_5m >= i_adxMin ? color.lime : color.red
+    _row(1, "5m ADX",
+         not na(adx_5m) ? str.tostring(adx_5m, "#.##") : "n/a", adxCol)
+
+    // 5m Kaufman ER
+    color erCol = not na(er_5m) and er_5m >= i_erMin ? color.lime : color.red
+    _row(2, "5m KER",
+         not na(er_5m)  ? str.tostring(er_5m, "#.###") : "n/a", erCol)
+
+    // 5m Trend
+    color  trendCol = not na(ema9_5m) and not na(ema21_5m) ?
+                      (ema9_5m > ema21_5m ? color.lime : color.red) : color.gray
+    string trendStr = not na(ema9_5m) and not na(ema21_5m) ?
+                      (ema9_5m > ema21_5m ? "BULL ▲" : "BEAR ▼") : "—"
+    _row(3, "5m Trend", trendStr, trendCol)
+
+    // vs VWAP
+    color  vwapCol = close > vwap1m ? color.lime : color.red
+    string vwapStr = close > vwap1m ? "ABOVE" : "BELOW"
+    _row(4, "vs VWAP", vwapStr, vwapCol)
+
+    // OR Valid
+    color  orCol = orValid ? color.lime : color.red
+    string orStr = not orLocked ? "Building…" : (orValid ? "VALID ✓" : "INVALID ✗")
+    _row(5, "OR Valid", orStr, orCol)
+
+    // Regime
+    color  regCol = regimeOK ? color.lime : color.red
+    _row(6, "Regime", regimeOK ? "GO ✓" : "NO GO ✗", regCol)
+
+    // Trade state
+    string stateStr = not armed               ? "IDLE" :
+                      strategy.position_size != 0 ?
+                      (tp2Hit ? "TP3/EMA9" : tp1Hit ? "BE+TP2" : "INITIAL") :
+                      "PENDING"
+    _row(7, "State", stateStr, color.white)
+
+    // 1R value
+    float rVal = not na(tp1Px) and not na(ent0) ? math.abs(tp1Px - ent0) : na
+    _row(8, "1R pts",
+         not na(rVal) ? str.tostring(rVal, "#.##") : "—", color.white)
+
+
+
+
+//Finished - Sally
