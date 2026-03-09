@@ -14,10 +14,10 @@ def test_conflict_resolution_prioritizes_and_blocks_overlap() -> None:
     selected, decisions = resolve_strategy_conflicts(candidates=cands, open_symbols=set())
 
     selected_strats = {c.strategy for c in selected}
-    # A outranks B on same symbol by module priority.
-    assert StrategyModule.STRAT_A_ORB in selected_strats
-    assert StrategyModule.STRAT_B_VWAP_REV not in selected_strats
-    # C vs D overlap in metals family conflict: C has higher priority.
+    # Highest score wins for overlapping symbol candidates.
+    assert StrategyModule.STRAT_B_VWAP_REV in selected_strats
+    assert StrategyModule.STRAT_A_ORB not in selected_strats
+    # Metals breakout and metals pair cannot both be selected.
     assert StrategyModule.STRAT_C_METALS_ORB in selected_strats
     assert StrategyModule.STRAT_D_PAIR not in selected_strats
     assert any(d.reason_code in {"SYMBOL_CONFLICT", "METALS_PAIR_CONFLICT"} for d in decisions if not d.accepted)
@@ -31,4 +31,3 @@ def test_open_symbol_gate_rejects_candidates() -> None:
     assert selected == []
     assert decisions[0].accepted is False
     assert decisions[0].reason_code == "SYMBOL_ALREADY_OPEN"
-

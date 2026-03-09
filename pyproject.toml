@@ -19,6 +19,9 @@ dependencies = [
 dev = [
   "pytest",
 ]
+live = [
+  "websockets>=12.0",
+]
 
 [project.scripts]
 futures-bot = "futures_bot.cli:main"

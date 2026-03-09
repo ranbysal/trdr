@@ -99,7 +99,8 @@ def _family_state() -> FamilyRegimeState:
 
 
 def _read_events(path: Path) -> list[dict[str, object]]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return [json.loads(line) for line in lines if line.strip()]
 
 
 def test_paper_engine_submits_and_fills_entry_with_slippage(tmp_path: Path) -> None:

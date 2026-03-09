@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -20,6 +19,7 @@ from futures_bot.data.calendar_store import LockoutStatus
 from futures_bot.pipeline.orb_pipeline import ORBFeatureSnapshot, ORBRiskVaultState, ORBSymbolSnapshot, run_strategy_a_orb_pipeline
 from futures_bot.regime.models import FamilyRegimeState
 from futures_bot.risk.slippage import estimate_slippage_ticks
+from futures_bot.runtime.ndjson_writer import NdjsonWriter
 from futures_bot.strategies.strategy_a_models import StrategyAEntryPlan, StrategyAPositionExitState
 from futures_bot.strategies.strategy_a_orb import StrategyAORB
 
@@ -66,25 +66,11 @@ class _OpenPosition:
     cumulative_realized_pnl: float = 0.0
 
 
-class _JsonLogWriter:
-    def __init__(self, path: str | Path) -> None:
-        self._path = Path(path)
-        self._events: list[dict[str, object]] = []
-        if self._path.exists():
-            existing = json.loads(self._path.read_text(encoding="utf-8"))
-            if isinstance(existing, list):
-                self._events = [e for e in existing if isinstance(e, dict)]
-
-    def write(self, event: dict[str, object]) -> None:
-        self._events.append(event)
-        self._path.write_text(json.dumps(self._events, indent=2, sort_keys=True, default=str), encoding="utf-8")
-
-
 class StrategyAPaperEngine:
     """Stateful paper execution engine over Strategy A pipeline outputs."""
 
     def __init__(self, *, trade_log_path: str | Path = "trade_logs.json") -> None:
-        self._log = _JsonLogWriter(trade_log_path)
+        self._log = NdjsonWriter(trade_log_path)
         self._pending_by_symbol: dict[str, _PendingEntry] = {}
         self._open_by_symbol: dict[str, _OpenPosition] = {}
         self._family_freeze: dict[Family, bool] = {}
