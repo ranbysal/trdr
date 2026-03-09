@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import UTC, datetime, time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +51,7 @@ class _MarketRow:
     atr_14_5m: float
     atr_14_1m_price: float
     rvol_3bar_aggregate_5m: float | None
+    low_volume_trend_streak_5m: int
     vol_strong_1m: bool
     data_ok: bool
     quote_ok: bool
@@ -115,6 +116,7 @@ class _OpenSingle:
     family: Family
     side: OrderSide
     entry_price: float
+    qty_initial: int
     qty_open: int
     qty_tp1: int
     qty_tp2: int
@@ -131,6 +133,7 @@ class _OpenSingle:
     atr_14_1m_price: float
     initial_risk_dollars: float
     realized_pnl: float = 0.0
+    last_exit_reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -227,6 +230,9 @@ class _MultiStrategyPaperRunner:
         self._family_freeze: dict[Family, bool] = {}
         self._price_hist: dict[str, list[float]] = {}
         self._last_close: dict[str, float] = {}
+        self._last_atr_1m_price: dict[str, float] = {}
+        self._session_day: datetime.date | None = None
+        self._session_realized_pnl: float = 0.0
 
     def flush(self) -> None:
         self._log.flush()
@@ -237,6 +243,7 @@ class _MultiStrategyPaperRunner:
         if len(self._price_hist[row.symbol]) > 500:
             self._price_hist[row.symbol] = self._price_hist[row.symbol][-500:]
         self._last_close[row.symbol] = row.close
+        self._last_atr_1m_price[row.symbol] = row.atr_14_1m_price
 
         family = _family_for_symbol(row.symbol)
         if family is None:
@@ -305,7 +312,7 @@ class _MultiStrategyPaperRunner:
     def _evaluate_a(self, *, row: _MarketRow, bar: Bar1m, instrument: InstrumentMeta) -> _CandidatePlan | None:
         features = StrategyAFeatureSnapshot(
             raw_regime=row.raw_regime,
-            low_volume_trend_streak_5m=0,
+            low_volume_trend_streak_5m=row.low_volume_trend_streak_5m,
             vol_strong_1m=row.vol_strong_1m,
             rvol_3bar_aggregate_5m=row.rvol_3bar_aggregate_5m,
             session_vwap=row.session_vwap,
@@ -591,6 +598,7 @@ class _MultiStrategyPaperRunner:
             routed_symbol=sizing.routed_symbol,
             qty=sizing.contracts,
             fill_price=row.close,
+            atr_14_1m_price=row.atr_14_1m_price,
         )
 
     def _fill_pending_if_triggered(self, row: _MarketRow) -> None:
@@ -641,6 +649,7 @@ class _MultiStrategyPaperRunner:
             routed_symbol=pending.routed_symbol,
             qty=pending.qty,
             fill_price=fill_price,
+            atr_14_1m_price=pending.atr_14_1m_price,
         )
         self._pending.pop(row.symbol, None)
 
@@ -653,6 +662,7 @@ class _MultiStrategyPaperRunner:
         routed_symbol: str,
         qty: int,
         fill_price: float,
+        atr_14_1m_price: float,
     ) -> None:
         tp1_qty = int(qty * plan.tp1_frac)
         tp2_qty = int(qty * plan.tp2_frac)
@@ -666,6 +676,7 @@ class _MultiStrategyPaperRunner:
             family=instrument.family,
             side=plan.side if isinstance(plan.side, OrderSide) else OrderSide.BUY,
             entry_price=fill_price,
+            qty_initial=qty,
             qty_open=qty,
             qty_tp1=tp1_qty,
             qty_tp2=tp2_qty,
@@ -679,7 +690,7 @@ class _MultiStrategyPaperRunner:
             flatten_by=plan.flatten_by,
             point_value=instrument.point_value,
             commission_rt=instrument.commission_rt,
-            atr_14_1m_price=1.0,
+            atr_14_1m_price=atr_14_1m_price,
             initial_risk_dollars=abs(fill_price - plan.initial_stop) * qty * instrument.point_value,
             realized_pnl=-(instrument.commission_rt * qty * 0.5),
         )
@@ -691,10 +702,14 @@ class _MultiStrategyPaperRunner:
                 "strategy": plan.candidate.strategy.value,
                 "position_id": pos.position_id,
                 "symbol": pos.symbol,
+                "routed_symbol": pos.routed_symbol,
                 "side": pos.side.value,
                 "qty": qty,
                 "fill_price": fill_price,
                 "entry_stop": plan.entry_price,
+                "initial_stop": plan.initial_stop,
+                "tp1_price": plan.tp1_price,
+                "tp2_price": plan.tp2_price,
             }
         )
 
@@ -771,7 +786,9 @@ class _MultiStrategyPaperRunner:
         commission = pos.commission_rt * qty * 0.5
         delta = gross - slip_cost - commission
         pos.realized_pnl += delta
-        self._halt.update_realized_pnl(realized_pnl=pos.realized_pnl)
+        pos.last_exit_reason = reason
+        self._session_realized_pnl += delta
+        self._halt.update_realized_pnl(realized_pnl=self._session_realized_pnl)
         self._log.write(
             {
                 "ts": ts.isoformat(),
@@ -783,6 +800,9 @@ class _MultiStrategyPaperRunner:
                 "qty_open": pos.qty_open,
                 "exit_reason": reason,
                 "exit_price": price,
+                "gross_pnl_delta": gross,
+                "slippage_cost_delta": slip_cost,
+                "commission_delta": commission,
                 "realized_pnl_delta": delta,
                 "realized_pnl_cum": pos.realized_pnl,
             }
@@ -803,6 +823,10 @@ class _MultiStrategyPaperRunner:
                 "strategy": pos.strategy.value,
                 "position_id": pos.position_id,
                 "symbol": pos.symbol,
+                "side": pos.side.value,
+                "entry_price": pos.entry_price,
+                "contracts_initial": pos.qty_initial,
+                "exit_reason": pos.last_exit_reason,
                 "realized_pnl": pos.realized_pnl,
                 "initial_risk_dollars": pos.initial_risk_dollars,
             }
@@ -842,8 +866,24 @@ class _MultiStrategyPaperRunner:
             return
         self._caps.record_open_position(family=lead_instr.family, symbol="MGC", risk_dollars=200.0)
         self._caps.record_open_position(family=hedge_instr.family, symbol=hedge_symbol, risk_dollars=200.0)
-        lead_price = self._last_close["MGC"]
-        hedge_price = self._last_close[hedge_symbol]
+        lead_market = self._last_close["MGC"]
+        hedge_market = self._last_close[hedge_symbol]
+        lead_entry_side, hedge_entry_side = _pair_entry_sides(str(plan.side))
+        lead_price = _fill_price_with_slippage(
+            price=lead_market,
+            side=lead_entry_side,
+            symbol="MGC",
+            instrument=lead_instr,
+            atr_14_1m_price=self._last_atr_1m_price.get("MGC", 0.0),
+        )
+        hedge_price = _fill_price_with_slippage(
+            price=hedge_market,
+            side=hedge_entry_side,
+            symbol=hedge_symbol,
+            instrument=hedge_instr,
+            atr_14_1m_price=self._last_atr_1m_price.get(hedge_symbol, 0.0),
+        )
+        entry_commission = (lead_instr.commission_rt * lead_qty * 0.5) + (hedge_instr.commission_rt * hedge_qty * 0.5)
         position = _OpenPair(
             position_id=utc_timestamp_id("paper_pair_MGC_SIL"),
             module_id=StrategyModule.STRAT_D_PAIR.value,
@@ -859,7 +899,7 @@ class _MultiStrategyPaperRunner:
             lead_entry=lead_price,
             hedge_entry=hedge_price,
             initial_risk_dollars=400.0,
-            realized_pnl=-(lead_instr.commission_rt * 0.5) - (hedge_instr.commission_rt * 0.5),
+            realized_pnl=-entry_commission,
         )
         self._open_pair[("MGC", hedge_symbol)] = position
         self._log.write(
@@ -873,6 +913,10 @@ class _MultiStrategyPaperRunner:
                 "lead_qty": position.lead_qty,
                 "hedge_qty": position.hedge_qty,
                 "side": position.side,
+                "lead_entry_price": position.lead_entry,
+                "hedge_entry_price": position.hedge_entry,
+                "entry_spread": position.entry_spread,
+                "initial_risk_dollars": position.initial_risk_dollars,
             }
         )
 
@@ -898,21 +942,39 @@ class _MultiStrategyPaperRunner:
                     self._close_pair(pos=pos, ts=row.ts, reason=reason)
 
     def _close_pair(self, *, pos: _OpenPair, ts: datetime, reason: str) -> None:
-        lead = self._last_close[pos.lead_symbol]
-        hedge = self._last_close[pos.hedge_symbol]
-        lead_pnl = (lead - pos.lead_entry) * pos.lead_qty * self._instrument_or_synthetic(
-            pos.lead_symbol,
-            Family.METALS,
-        ).point_value
-        hedge_pnl = (hedge - pos.hedge_entry) * pos.hedge_qty * self._instrument_or_synthetic(
-            pos.hedge_symbol,
-            Family.METALS,
-        ).point_value
+        lead_instr = self._instrument_or_synthetic(pos.lead_symbol, Family.METALS)
+        hedge_instr = self._instrument_or_synthetic(pos.hedge_symbol, Family.METALS)
+        lead_market = self._last_close[pos.lead_symbol]
+        hedge_market = self._last_close[pos.hedge_symbol]
+        lead_exit_side, hedge_exit_side = _pair_exit_sides(pos.side)
+        lead_exit = _fill_price_with_slippage(
+            price=lead_market,
+            side=lead_exit_side,
+            symbol=pos.lead_symbol,
+            instrument=lead_instr,
+            atr_14_1m_price=self._last_atr_1m_price.get(pos.lead_symbol, 0.0),
+        )
+        hedge_exit = _fill_price_with_slippage(
+            price=hedge_market,
+            side=hedge_exit_side,
+            symbol=pos.hedge_symbol,
+            instrument=hedge_instr,
+            atr_14_1m_price=self._last_atr_1m_price.get(pos.hedge_symbol, 0.0),
+        )
         if pos.side == "short_spread":
-            pair_pnl = lead_pnl - hedge_pnl
+            lead_pnl = (pos.lead_entry - lead_exit) * pos.lead_qty * lead_instr.point_value
+            hedge_pnl = (hedge_exit - pos.hedge_entry) * pos.hedge_qty * hedge_instr.point_value
         else:
-            pair_pnl = -lead_pnl + hedge_pnl
-        pos.realized_pnl += pair_pnl
+            lead_pnl = (lead_exit - pos.lead_entry) * pos.lead_qty * lead_instr.point_value
+            hedge_pnl = (pos.hedge_entry - hedge_exit) * pos.hedge_qty * hedge_instr.point_value
+        gross_pair_pnl = lead_pnl + hedge_pnl
+        exit_commission = (lead_instr.commission_rt * pos.lead_qty * 0.5) + (
+            hedge_instr.commission_rt * pos.hedge_qty * 0.5
+        )
+        net_delta = gross_pair_pnl - exit_commission
+        pos.realized_pnl += net_delta
+        self._session_realized_pnl += net_delta
+        self._halt.update_realized_pnl(realized_pnl=self._session_realized_pnl)
         self._cooldowns.record_closed_trade(
             module_id=pos.module_id,
             symbol=pos.lead_symbol,
@@ -936,6 +998,18 @@ class _MultiStrategyPaperRunner:
                 "lead_symbol": pos.lead_symbol,
                 "hedge_symbol": pos.hedge_symbol,
                 "reason": reason,
+                "exit_reason": reason,
+                "side": pos.side,
+                "lead_qty": pos.lead_qty,
+                "hedge_qty": pos.hedge_qty,
+                "lead_entry_price": pos.lead_entry,
+                "hedge_entry_price": pos.hedge_entry,
+                "lead_exit_price": lead_exit,
+                "hedge_exit_price": hedge_exit,
+                "entry_spread": pos.entry_spread,
+                "exit_spread": lead_exit - (pos.beta * hedge_exit),
+                "gross_pnl": gross_pair_pnl,
+                "commission_delta": exit_commission,
                 "realized_pnl": pos.realized_pnl,
                 "initial_risk_dollars": pos.initial_risk_dollars,
             }
@@ -1007,12 +1081,12 @@ class _MultiStrategyPaperRunner:
         raise KeyError(f"Unknown instrument for synthetic fallback: {symbol}")
 
     def _roll_session_if_needed(self, ts: datetime) -> None:
-        if ts.tzinfo is not None:
-            ts_utc = ts.astimezone(UTC)
-        else:
-            ts_utc = ts.replace(tzinfo=UTC)
-        if ts_utc.time() == time(0, 0):
-            self._halt.reset_session(session_start_equity=100_000.0)
+        day = ts.date()
+        if self._session_day == day:
+            return
+        self._session_day = day
+        self._session_realized_pnl = 0.0
+        self._halt.reset_session(session_start_equity=100_000.0)
 
 
 def _bar_from_row(row: _MarketRow) -> Bar1m:
@@ -1054,6 +1128,7 @@ def _parse_row(raw: dict[str, str]) -> _MarketRow:
         atr_14_5m=float(raw.get("atr_14_5m", "1.0") or 1.0),
         atr_14_1m_price=float(raw.get("atr_14_1m_price", "1.0") or 1.0),
         rvol_3bar_aggregate_5m=_float_or_none(raw.get("rvol_3bar_aggregate_5m")),
+        low_volume_trend_streak_5m=int(raw.get("low_volume_trend_streak_5m", "0") or 0),
         vol_strong_1m=_to_bool(raw.get("vol_strong_1m", "true")),
         data_ok=_to_bool(raw.get("data_ok", "true")),
         quote_ok=_to_bool(raw.get("quote_ok", "true")),
@@ -1082,6 +1157,7 @@ def _row_from_mapping(raw: dict[str, Any]) -> _MarketRow:
         atr_14_5m=float(raw.get("atr_14_5m", 1.0)),
         atr_14_1m_price=float(raw.get("atr_14_1m_price", 1.0)),
         rvol_3bar_aggregate_5m=_float_or_none(raw.get("rvol_3bar_aggregate_5m")),
+        low_volume_trend_streak_5m=int(raw.get("low_volume_trend_streak_5m", 0)),
         vol_strong_1m=bool(raw.get("vol_strong_1m", True)),
         data_ok=bool(raw.get("data_ok", True)),
         quote_ok=bool(raw.get("quote_ok", True)),
@@ -1112,6 +1188,37 @@ def _estimate_slippage(*, symbol: str, atr_14_1m_price: float, tick_size: float)
         return 0.0
     atr_ticks = atr_14_1m_price / tick_size
     return estimate_slippage_ticks(symbol, atr_ticks).slippage_est_ticks
+
+
+def _fill_price_with_slippage(
+    *,
+    price: float,
+    side: OrderSide,
+    symbol: str,
+    instrument: InstrumentMeta,
+    atr_14_1m_price: float,
+) -> float:
+    slip_ticks = _estimate_slippage(
+        symbol=symbol,
+        atr_14_1m_price=atr_14_1m_price,
+        tick_size=instrument.tick_size,
+    )
+    slip_px = slip_ticks * instrument.tick_size
+    if side is OrderSide.BUY:
+        return price + slip_px
+    return price - slip_px
+
+
+def _pair_entry_sides(side: str) -> tuple[OrderSide, OrderSide]:
+    if side == "short_spread":
+        return OrderSide.SELL, OrderSide.BUY
+    return OrderSide.BUY, OrderSide.SELL
+
+
+def _pair_exit_sides(side: str) -> tuple[OrderSide, OrderSide]:
+    if side == "short_spread":
+        return OrderSide.BUY, OrderSide.SELL
+    return OrderSide.SELL, OrderSide.BUY
 
 
 def _float_or_none(value: Any) -> float | None:

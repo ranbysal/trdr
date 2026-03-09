@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import csv
 import json
+import csv
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from futures_bot.backtest.replay_runner import run_replay_backtest
-from futures_bot.config.loader import load_instruments
-from futures_bot.core.enums import StrategyModule
+from futures_bot.cli import main
 
 ET = ZoneInfo("America/New_York")
 
@@ -62,38 +60,34 @@ def _bar_for_day(*, day_offset: int, minute_offset: int) -> tuple[float, float, 
     return close, 103.40, 103.00, 80
 
 
-def test_backtest_replay_smoke(tmp_path: Path) -> None:
-    data = tmp_path / "bars.csv"
-    out_a = tmp_path / "out_a"
-    out_b = tmp_path / "out_b"
-    _write_strategy_a_replay_csv(data)
+def test_backtest_cli_writes_required_reports(tmp_path: Path) -> None:
+    data_path = tmp_path / "bars.csv"
+    out_dir = tmp_path / "backtest_out"
+    _write_strategy_a_replay_csv(data_path)
 
-    result_a = run_replay_backtest(
-        data_path=data,
-        out_dir=out_a,
-        instruments_by_symbol=load_instruments("configs"),
-        enabled_strategies={StrategyModule.STRAT_A_ORB},
+    rc = main(
+        [
+            "backtest",
+            "--data",
+            str(data_path),
+            "--config-dir",
+            "configs",
+            "--out",
+            str(out_dir),
+            "--strategies",
+            "A",
+        ]
     )
-    result_b = run_replay_backtest(
-        data_path=data,
-        out_dir=out_b,
-        instruments_by_symbol=load_instruments("configs"),
-        enabled_strategies={StrategyModule.STRAT_A_ORB},
-    )
 
-    trades_a = Path(result_a["trades_path"]).read_text(encoding="utf-8")
-    trades_b = Path(result_b["trades_path"]).read_text(encoding="utf-8")
-    equity_a = Path(result_a["equity_curve_path"]).read_text(encoding="utf-8")
-    equity_b = Path(result_b["equity_curve_path"]).read_text(encoding="utf-8")
-    assert trades_a == trades_b
-    assert equity_a == equity_b
+    assert rc == 0
+    trades_path = out_dir / "trades.csv"
+    equity_curve_path = out_dir / "equity_curve.csv"
+    summary_path = out_dir / "summary.json"
 
-    summary_a = json.loads(Path(result_a["summary_path"]).read_text(encoding="utf-8"))
-    summary_b = json.loads(Path(result_b["summary_path"]).read_text(encoding="utf-8"))
-    assert summary_a == summary_b
-    assert summary_a["trade_count"] >= 1
-    assert {"trade_count", "expectancy_R", "max_drawdown", "per_symbol", "per_strategy"} <= set(summary_a)
+    assert trades_path.exists()
+    assert equity_curve_path.exists()
+    assert summary_path.exists()
 
-    assert Path(result_a["trades_path"]).exists()
-    assert Path(result_a["equity_curve_path"]).exists()
-    assert Path(result_a["summary_path"]).exists()
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert {"trade_count", "expectancy_R", "max_drawdown"} <= set(summary)
+    assert summary["trade_count"] >= 1

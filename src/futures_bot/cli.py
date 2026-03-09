@@ -17,10 +17,10 @@ from futures_bot.policy import cro_policy
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="futures-bot", description="Futures bot CLI scaffold")
+    parser = argparse.ArgumentParser(prog="futures-bot", description="Futures bot CLI")
     subparsers = parser.add_subparsers(dest="command")
 
-    backtest = subparsers.add_parser("backtest", help="Run historical backtest (scaffold)")
+    backtest = subparsers.add_parser("backtest", help="Run deterministic historical replay backtest")
     backtest.add_argument("--config-dir", default="configs", help="Configuration directory")
     backtest.add_argument("--data", required=False, help="1m CSV input for replay")
     backtest.add_argument("--out", default="backtest_out", help="Output directory")
@@ -35,7 +35,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Bypass strict config-vs-policy startup guard",
     )
 
-    paper = subparsers.add_parser("paper", help="Run paper trading loop (scaffold)")
+    paper = subparsers.add_parser("paper", help="Run paper trading loop")
     paper.add_argument("--config-dir", default="configs", help="Configuration directory")
     paper.add_argument("--data", required=False, help="CSV input for paper loop")
     paper.add_argument("--out", default="paper_out", help="Output directory")
@@ -115,12 +115,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             except ValueError as exc:
                 parser.error(str(exc))
             instruments = load_instruments(args.config_dir)
-            run_replay_backtest(
-                data_path=args.data,
-                out_dir=args.out,
-                instruments_by_symbol=instruments,
-                enabled_strategies=enabled,
-            )
+            try:
+                run_replay_backtest(
+                    data_path=args.data,
+                    out_dir=args.out,
+                    instruments_by_symbol=instruments,
+                    enabled_strategies=enabled,
+                    config_snapshot=configs,
+                )
+            except (FileNotFoundError, RuntimeError, ValueError) as exc:
+                parser.exit(2, f"backtest failed: {exc}\n")
         if args.command == "live":
             if not args.ws_url:
                 parser.error("--ws-url is required for live mode")
