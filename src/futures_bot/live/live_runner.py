@@ -1,4 +1,4 @@
-"""Live feed runner that drives paper execution from websocket bars/quotes."""
+"""Live feed runner that drives signal generation from websocket bars/quotes."""
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ from futures_bot.core.enums import Family, Regime, StrategyModule
 from futures_bot.core.types import InstrumentMeta
 from futures_bot.live.feed_models import FeedMessage
 from futures_bot.live.ws_client import LiveWsClient
-from futures_bot.pipeline.multistrategy_paper import MultiStrategyPaperEngine
+from futures_bot.alerts.telegram import TelegramNotifier
+from futures_bot.pipeline.multistrategy_signals import MultiStrategySignalEngine
 from futures_bot.runtime.ndjson_writer import NdjsonWriter
 
 
@@ -39,7 +40,7 @@ class _SymbolState:
     vol_5m: deque[float] = field(default_factory=lambda: deque(maxlen=20))
 
 
-class LivePaperRunner:
+class LiveSignalRunner:
     def __init__(
         self,
         *,
@@ -47,15 +48,17 @@ class LivePaperRunner:
         out_dir: str | Path,
         instruments_by_symbol: dict[str, InstrumentMeta],
         enabled_strategies: set[StrategyModule],
+        notifier: TelegramNotifier | None = None,
         queue_maxsize: int = 2000,
     ) -> None:
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
         self._events_log = NdjsonWriter(out_path / "live_events.ndjson")
-        self._engine = MultiStrategyPaperEngine(
-            log_path=out_path / "trade_logs.json",
+        self._engine = MultiStrategySignalEngine(
+            out_dir=out_path,
             instruments_by_symbol=instruments_by_symbol,
             enabled_strategies=enabled_strategies,
+            notifier=notifier,
         )
         self._states: dict[str, _SymbolState] = {}
         self._global_freeze = False
@@ -289,23 +292,21 @@ class LivePaperRunner:
         )
 
 
-async def run_live_paper(
+async def run_live_signals(
     *,
     ws_url: str,
     out_dir: str | Path,
     instruments_by_symbol: dict[str, InstrumentMeta],
     enabled_strategies: set[StrategyModule],
-    paper: bool = True,
+    notifier: TelegramNotifier | None = None,
     max_messages: int | None = None,
     max_runtime_s: float | None = None,
 ) -> None:
-    if not paper:
-        raise ValueError("only --paper mode is supported")
-
-    runner = LivePaperRunner(
+    runner = LiveSignalRunner(
         ws_url=ws_url,
         out_dir=out_dir,
         instruments_by_symbol=instruments_by_symbol,
         enabled_strategies=enabled_strategies,
+        notifier=notifier,
     )
     await runner.run(max_messages=max_messages, max_runtime_s=max_runtime_s)

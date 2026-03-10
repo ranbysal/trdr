@@ -17,5 +17,5 @@ def test_cli_help_runs(capsys: pytest.CaptureFixture[str]) -> None:
     output = capsys.readouterr().out
     assert "futures-bot" in output
     assert "backtest" in output
-    assert "paper" in output
+    assert "signals" in output
     assert "validate-config" in output

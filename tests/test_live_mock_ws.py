@@ -10,7 +10,7 @@ import pytest
 
 from futures_bot.config.loader import load_instruments
 from futures_bot.core.enums import StrategyModule
-from futures_bot.live.live_runner import run_live_paper
+from futures_bot.live.live_runner import run_live_signals
 from futures_bot.live.ws_client import LiveWsClient
 
 websockets = pytest.importorskip("websockets")
@@ -110,12 +110,11 @@ def test_live_runner_mock_server_smoke(tmp_path: Path) -> None:
         out_dir = tmp_path / "live_out"
 
         try:
-            await run_live_paper(
+            await run_live_signals(
                 ws_url=f"ws://127.0.0.1:{port}",
                 out_dir=out_dir,
                 instruments_by_symbol=load_instruments("configs"),
                 enabled_strategies={StrategyModule.STRAT_A_ORB},
-                paper=True,
                 max_messages=17,
                 max_runtime_s=5.0,
             )
@@ -124,6 +123,7 @@ def test_live_runner_mock_server_smoke(tmp_path: Path) -> None:
             await server.wait_closed()
 
         assert (out_dir / "live_events.ndjson").exists()
-        assert (out_dir / "trade_logs.json").exists() or (out_dir / "live_events.ndjson").stat().st_size > 0
+        assert (out_dir / "signal_events.ndjson").exists()
+        assert (out_dir / "active_ideas.json").exists()
 
     asyncio.run(scenario())

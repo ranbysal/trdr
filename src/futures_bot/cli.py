@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+import os
 from collections.abc import Sequence
 
+from futures_bot.alerts.telegram import TelegramNotifier
 from futures_bot.config.loader import load_all_configs
 from futures_bot.config.loader import load_instruments
 from futures_bot.backtest.replay_runner import run_replay_backtest
 from futures_bot.config.policy_guard import enforce_policy_guard
 from futures_bot.core.enums import StrategyModule
-from futures_bot.live.live_runner import run_live_paper
-from futures_bot.pipeline.multistrategy_paper import run_multistrategy_paper_loop
+from futures_bot.live.live_runner import run_live_signals
+from futures_bot.pipeline.multistrategy_signals import run_multistrategy_signal_loop
 from futures_bot.policy import cro_policy
 
 
@@ -35,21 +37,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Bypass strict config-vs-policy startup guard",
     )
 
-    paper = subparsers.add_parser("paper", help="Run paper trading loop")
-    paper.add_argument("--config-dir", default="configs", help="Configuration directory")
-    paper.add_argument("--data", required=False, help="CSV input for paper loop")
-    paper.add_argument("--out", default="paper_out", help="Output directory")
-    paper.add_argument(
-        "--strategies",
-        default="A",
-        help="Comma-separated strategy set from A,B,C,D",
-    )
-    paper.add_argument(
-        "--allow-policy-drift",
-        action="store_true",
-        help="Bypass strict config-vs-policy startup guard",
-    )
-
     validate = subparsers.add_parser("validate-config", help="Validate configuration files")
     validate.add_argument("--config-dir", default="configs", help="Configuration directory")
     validate.add_argument(
@@ -58,17 +45,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Bypass strict config-vs-policy startup guard",
     )
 
-    live = subparsers.add_parser("live", help="Run live websocket ingestion loop")
-    live.add_argument("--ws-url", required=False, help="Websocket URL")
-    live.add_argument("--config-dir", default="configs", help="Configuration directory")
-    live.add_argument("--out", default="live_out", help="Output directory")
-    live.add_argument(
+    signals = subparsers.add_parser("signals", help="Run the live signal watcher and Telegram alerts")
+    signals.add_argument("--ws-url", default=os.getenv("FUTURES_BOT_WS_URL"), help="Websocket URL")
+    signals.add_argument("--data", required=False, help="CSV input for deterministic signal replay")
+    signals.add_argument("--config-dir", default="configs", help="Configuration directory")
+    signals.add_argument("--out", default="out/signals_live", help="Output directory")
+    signals.add_argument(
         "--strategies",
         default="A",
         help="Comma-separated strategy set from A,B,C,D",
     )
-    live.add_argument("--paper", action="store_true", help="Run paper execution only")
-    live.add_argument(
+    signals.add_argument("--telegram-token", default=os.getenv("TELEGRAM_BOT_TOKEN"), help="Telegram bot token")
+    signals.add_argument("--telegram-chat-id", default=os.getenv("TELEGRAM_CHAT_ID"), help="Telegram chat id")
+    signals.add_argument(
         "--allow-policy-drift",
         action="store_true",
         help="Bypass strict config-vs-policy startup guard",
@@ -85,7 +74,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 0
 
-    if args.command in {"validate-config", "backtest", "paper", "live"}:
+    if args.command in {"validate-config", "backtest", "signals"}:
         configs = load_all_configs(args.config_dir)
         risk_cfg = configs.get("risk", {})
         enforce_policy_guard(
@@ -93,20 +82,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             cro_policy,
             allow_policy_drift=args.allow_policy_drift,
         )
-        if args.command == "paper":
-            if not args.data:
-                parser.error("--data is required for paper mode")
-            try:
-                enabled = _parse_strategies(args.strategies)
-            except ValueError as exc:
-                parser.error(str(exc))
-            instruments = load_instruments(args.config_dir)
-            run_multistrategy_paper_loop(
-                data_path=args.data,
-                out_dir=args.out,
-                instruments_by_symbol=instruments,
-                enabled_strategies=enabled,
-            )
         if args.command == "backtest":
             if not args.data:
                 parser.error("--data is required for backtest mode")
@@ -125,25 +100,36 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             except (FileNotFoundError, RuntimeError, ValueError) as exc:
                 parser.exit(2, f"backtest failed: {exc}\n")
-        if args.command == "live":
-            if not args.ws_url:
-                parser.error("--ws-url is required for live mode")
-            if not args.paper:
-                parser.error("--paper is required in live mode")
+        if args.command == "signals":
             try:
                 enabled = _parse_strategies(args.strategies)
             except ValueError as exc:
                 parser.error(str(exc))
             instruments = load_instruments(args.config_dir)
-            asyncio.run(
-                run_live_paper(
-                    ws_url=args.ws_url,
+            notifier = TelegramNotifier(
+                token=args.telegram_token,
+                chat_id=args.telegram_chat_id,
+            )
+            if args.data:
+                run_multistrategy_signal_loop(
+                    data_path=args.data,
                     out_dir=args.out,
                     instruments_by_symbol=instruments,
                     enabled_strategies=enabled,
-                    paper=True,
+                    notifier=notifier,
                 )
-            )
+            else:
+                if not args.ws_url:
+                    parser.error("--ws-url is required for live signals unless FUTURES_BOT_WS_URL is set")
+                asyncio.run(
+                    run_live_signals(
+                        ws_url=args.ws_url,
+                        out_dir=args.out,
+                        instruments_by_symbol=instruments,
+                        enabled_strategies=enabled,
+                        notifier=notifier,
+                    )
+                )
         return 0
 
     parser.error(f"Unknown command: {args.command}")

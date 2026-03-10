@@ -165,7 +165,7 @@ def test_multistrategy_paper_smoke(tmp_path: Path) -> None:
 
     rc = main(
         [
-            "paper",
+            "signals",
             "--data",
             str(csv_path),
             "--config-dir",
@@ -178,12 +178,13 @@ def test_multistrategy_paper_smoke(tmp_path: Path) -> None:
     )
     assert rc == 0
 
-    log_path = out_dir / "trade_logs.json"
+    log_path = out_dir / "signal_events.ndjson"
     assert log_path.exists()
     lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert lines
     events = [json.loads(line) for line in lines]
-    strategies = {e.get("strategy") for e in events if "strategy" in e}
+    strategies = {e.get("strategy") for e in events if e.get("event") == "signal_alert"}
     assert "strat_a_orb" in strategies
     assert "strat_b_vwap_rev" in strategies
     assert "strat_c_metals_orb" in strategies
+    assert (out_dir / "active_ideas.json").exists()

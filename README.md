@@ -1,11 +1,12 @@
 # futures-bot
 
-Production-grade scaffold for a deterministic futures signal bot.
+Signal-only futures market watcher for live monitoring and Telegram trade alerts.
 
 ## Requirements
 
 - Python 3.11
 - Dependencies: `numpy`, `pandas`, `pyyaml`
+- Optional live dependency: `websockets`
 - Dev dependencies: `pytest`
 
 ## Quickstart
@@ -20,19 +21,49 @@ make test
 ```bash
 futures-bot --help
 futures-bot backtest --help
-futures-bot paper --help
+futures-bot signals --help
 futures-bot validate-config --help
 ```
 
-## Project Layout
+## Architecture
 
-- `src/` package layout
-- `configs/` runtime configuration YAML scaffolding
-- `tests/` unit test scaffolding
+- Primary path: `live data -> features/regime/strategies -> signal engine -> Telegram notifier`
+- The bot does not place, modify, or cancel live orders.
+- Strategy math remains in the existing strategy modules.
+- Signal lifecycle is tracked through `NEW_SIGNAL`, `ENTRY_ZONE_ACTIVE`, `ENTRY_MISSED`,
+  `IN_POSITION_ASSUMED_FALSE`, `PARTIAL_TAKE_SUGGESTED`, `STOP_TO_BREAKEVEN_SUGGESTED`,
+  `TP_EXTENSION_SUGGESTED`, `THESIS_INVALIDATED`, and `CLOSE_SIGNAL`.
+- Alert state is written to `active_ideas.json` and alert events to `signal_events.ndjson`.
 
-No trading strategy logic is implemented in this scaffold.
+## Running Live Signals
 
-## Codespaces Rebuild and Tests
+Set environment variables for live mode:
+
+```bash
+export FUTURES_BOT_WS_URL="wss://your-feed"
+export TELEGRAM_BOT_TOKEN="123456:token"
+export TELEGRAM_CHAT_ID="123456789"
+```
+
+Run the live watcher:
+
+```bash
+futures-bot signals --config-dir configs --out out/signals_live
+```
+
+For deterministic replay without Telegram delivery:
+
+```bash
+futures-bot signals --config-dir configs --data path/to/bars.csv --out out/signals_replay
+```
+
+## Notes
+
+- Historical replay backtests remain available through `futures-bot backtest`.
+- Legacy paper-execution modules are no longer on the primary CLI path.
+- `src/futures_bot/broker/read_only.py` contains placeholders for future read-only broker/account polling only.
+
+## Codespaces and Tests
 
 If dependencies are missing or environment is stale, rebuild the container:
 

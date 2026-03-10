@@ -1,5 +1,5 @@
-"""Live websocket ingestion and runner helpers."""
+"""Live websocket ingestion and signal runner helpers."""
 
-from futures_bot.live.live_runner import run_live_paper
+from futures_bot.live.live_runner import run_live_signals
 
-__all__ = ["run_live_paper"]
+__all__ = ["run_live_signals"]
