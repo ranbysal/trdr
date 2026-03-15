@@ -1,4 +1,4 @@
-"""Live feed runner that drives signal generation from websocket bars/quotes."""
+"""Live feed runner that drives signal generation from live bars/quotes."""
 
 from __future__ import annotations
 
@@ -9,8 +9,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from futures_bot.core.enums import Family, Regime, StrategyModule
+from futures_bot.core.enums import Regime, StrategyModule
 from futures_bot.core.types import InstrumentMeta
+from futures_bot.live.databento_adapter import DatabentoLiveClient
 from futures_bot.live.feed_models import FeedMessage
 from futures_bot.live.ws_client import LiveWsClient
 from futures_bot.alerts.telegram import TelegramNotifier
@@ -44,12 +45,15 @@ class LiveSignalRunner:
     def __init__(
         self,
         *,
-        ws_url: str,
         out_dir: str | Path,
         instruments_by_symbol: dict[str, InstrumentMeta],
         enabled_strategies: set[StrategyModule],
+        feed_client: Any | None = None,
         notifier: TelegramNotifier | None = None,
         queue_maxsize: int = 2000,
+        databento_api_key: str | None = None,
+        databento_dataset: str = "GLBX.MDP3",
+        ws_url: str | None = None,
     ) -> None:
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
@@ -63,10 +67,12 @@ class LiveSignalRunner:
         self._states: dict[str, _SymbolState] = {}
         self._global_freeze = False
         self._lockout = False
-        self._client = LiveWsClient(
-            ws_url=ws_url,
+        self._client = feed_client or self._build_client(
+            databento_api_key=databento_api_key,
+            databento_dataset=databento_dataset,
+            instruments_by_symbol=instruments_by_symbol,
             queue_maxsize=queue_maxsize,
-            on_overload=self._on_overload,
+            ws_url=ws_url,
         )
 
     async def run(self, *, max_messages: int | None = None, max_runtime_s: float | None = None) -> None:
@@ -151,7 +157,10 @@ class LiveSignalRunner:
                 )
         state.last_bar_ts = bar_ts
 
-        quote_ok = state.last_quote_ts is not None and (bar_ts - state.last_quote_ts).total_seconds() <= 15.0
+        quote_required = bool(getattr(self._client, "quote_schema_enabled", True))
+        quote_ok = (not quote_required) or (
+            state.last_quote_ts is not None and (bar_ts - state.last_quote_ts).total_seconds() <= 15.0
+        )
 
         state.cum_pv += bar_close * bar_volume
         state.cum_vol += bar_volume
@@ -291,22 +300,53 @@ class LiveSignalRunner:
             }
         )
 
+    def _build_client(
+        self,
+        *,
+        databento_api_key: str | None,
+        databento_dataset: str,
+        instruments_by_symbol: dict[str, InstrumentMeta],
+        queue_maxsize: int,
+        ws_url: str | None,
+    ) -> Any:
+        if databento_api_key:
+            return DatabentoLiveClient(
+                api_key=databento_api_key,
+                dataset=databento_dataset,
+                symbols=sorted(instruments_by_symbol),
+                queue_maxsize=queue_maxsize,
+                on_overload=self._on_overload,
+            )
+        if ws_url:
+            return LiveWsClient(
+                ws_url=ws_url,
+                queue_maxsize=queue_maxsize,
+                on_overload=self._on_overload,
+            )
+        raise ValueError("live feed client configuration is required")
+
 
 async def run_live_signals(
     *,
-    ws_url: str,
     out_dir: str | Path,
     instruments_by_symbol: dict[str, InstrumentMeta],
     enabled_strategies: set[StrategyModule],
     notifier: TelegramNotifier | None = None,
     max_messages: int | None = None,
     max_runtime_s: float | None = None,
+    databento_api_key: str | None = None,
+    databento_dataset: str = "GLBX.MDP3",
+    feed_client: Any | None = None,
+    ws_url: str | None = None,
 ) -> None:
     runner = LiveSignalRunner(
-        ws_url=ws_url,
         out_dir=out_dir,
         instruments_by_symbol=instruments_by_symbol,
         enabled_strategies=enabled_strategies,
+        feed_client=feed_client,
         notifier=notifier,
+        databento_api_key=databento_api_key,
+        databento_dataset=databento_dataset,
+        ws_url=ws_url,
     )
     await runner.run(max_messages=max_messages, max_runtime_s=max_runtime_s)

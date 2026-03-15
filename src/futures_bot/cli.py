@@ -6,6 +6,7 @@ import asyncio
 import argparse
 import os
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from futures_bot.alerts.telegram import TelegramNotifier
 from futures_bot.config.loader import load_all_configs
@@ -16,6 +17,14 @@ from futures_bot.core.enums import StrategyModule
 from futures_bot.live.live_runner import run_live_signals
 from futures_bot.pipeline.multistrategy_signals import run_multistrategy_signal_loop
 from futures_bot.policy import cro_policy
+
+
+@dataclass(frozen=True, slots=True)
+class LiveSignalSettings:
+    databento_api_key: str
+    databento_dataset: str
+    telegram_token: str
+    telegram_chat_id: str
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -46,7 +55,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     signals = subparsers.add_parser("signals", help="Run the live signal watcher and Telegram alerts")
-    signals.add_argument("--ws-url", default=os.getenv("FUTURES_BOT_WS_URL"), help="Websocket URL")
     signals.add_argument("--data", required=False, help="CSV input for deterministic signal replay")
     signals.add_argument("--config-dir", default="configs", help="Configuration directory")
     signals.add_argument("--out", default="out/signals_live", help="Output directory")
@@ -54,6 +62,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--strategies",
         default="A",
         help="Comma-separated strategy set from A,B,C,D",
+    )
+    signals.add_argument(
+        "--databento-api-key",
+        default=os.getenv("DATABENTO_API_KEY"),
+        help="Databento API key",
+    )
+    signals.add_argument(
+        "--databento-dataset",
+        default=os.getenv("DATABENTO_DATASET", "GLBX.MDP3"),
+        help="Databento dataset",
     )
     signals.add_argument("--telegram-token", default=os.getenv("TELEGRAM_BOT_TOKEN"), help="Telegram bot token")
     signals.add_argument("--telegram-chat-id", default=os.getenv("TELEGRAM_CHAT_ID"), help="Telegram chat id")
@@ -119,15 +137,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     notifier=notifier,
                 )
             else:
-                if not args.ws_url:
-                    parser.error("--ws-url is required for live signals unless FUTURES_BOT_WS_URL is set")
+                try:
+                    live_settings = _resolve_live_signal_settings(args)
+                except ValueError as exc:
+                    parser.error(str(exc))
                 asyncio.run(
                     run_live_signals(
-                        ws_url=args.ws_url,
                         out_dir=args.out,
                         instruments_by_symbol=instruments,
                         enabled_strategies=enabled,
                         notifier=notifier,
+                        databento_api_key=live_settings.databento_api_key,
+                        databento_dataset=live_settings.databento_dataset,
                     )
                 )
         return 0
@@ -153,6 +174,25 @@ def _parse_strategies(raw: str) -> set[StrategyModule]:
     if not enabled:
         raise ValueError("At least one strategy must be enabled")
     return enabled
+
+
+def _resolve_live_signal_settings(args: argparse.Namespace) -> LiveSignalSettings:
+    missing: list[str] = []
+    if not getattr(args, "databento_api_key", None):
+        missing.append("DATABENTO_API_KEY")
+    if not getattr(args, "telegram_token", None):
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not getattr(args, "telegram_chat_id", None):
+        missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        joined = ", ".join(missing)
+        raise ValueError(f"live signals require environment variables or flags for: {joined}")
+    return LiveSignalSettings(
+        databento_api_key=args.databento_api_key,
+        databento_dataset=args.databento_dataset,
+        telegram_token=args.telegram_token,
+        telegram_chat_id=args.telegram_chat_id,
+    )
 
 
 if __name__ == "__main__":

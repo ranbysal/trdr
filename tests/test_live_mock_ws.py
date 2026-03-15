@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -16,6 +17,19 @@ from futures_bot.live.ws_client import LiveWsClient
 websockets = pytest.importorskip("websockets")
 
 ET = ZoneInfo("America/New_York")
+
+
+async def _serve_on_random_port(handler):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen()
+        sock.setblocking(False)
+    except PermissionError as exc:
+        pytest.skip(f"socket creation not permitted in this environment: {exc}")
+    port = sock.getsockname()[1]
+    server = await websockets.serve(handler, sock=sock)
+    return server, port
 
 
 def test_ws_client_reconnects_with_mock_server() -> None:
@@ -37,8 +51,7 @@ def test_ws_client_reconnects_with_mock_server() -> None:
             )
             await conn.close()
 
-        server = await websockets.serve(handler, "127.0.0.1", 0)
-        port = server.sockets[0].getsockname()[1]
+        server, port = await _serve_on_random_port(handler)
         client = LiveWsClient(ws_url=f"ws://127.0.0.1:{port}", queue_maxsize=10)
         await client.start()
 
@@ -105,8 +118,7 @@ def test_live_runner_mock_server_smoke(tmp_path: Path) -> None:
                 await asyncio.sleep(0.01)
             await conn.close()
 
-        server = await websockets.serve(handler, "127.0.0.1", 0)
-        port = server.sockets[0].getsockname()[1]
+        server, port = await _serve_on_random_port(handler)
         out_dir = tmp_path / "live_out"
 
         try:

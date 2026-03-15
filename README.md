@@ -5,8 +5,8 @@ Signal-only futures market watcher for live monitoring and Telegram trade alerts
 ## Requirements
 
 - Python 3.11
-- Dependencies: `numpy`, `pandas`, `pyyaml`
-- Optional live dependency: `websockets`
+- Dependencies: `databento`, `numpy`, `pandas`, `pyyaml`
+- Optional mock/live-test dependency: `websockets`
 - Dev dependencies: `pytest`
 
 ## Quickstart
@@ -40,7 +40,8 @@ futures-bot validate-config --help
 Set environment variables for live mode:
 
 ```bash
-export FUTURES_BOT_WS_URL="wss://your-feed"
+export DATABENTO_API_KEY="your-databento-key"
+export DATABENTO_DATASET="GLBX.MDP3"
 export TELEGRAM_BOT_TOKEN="123456:token"
 export TELEGRAM_CHAT_ID="123456789"
 ```
