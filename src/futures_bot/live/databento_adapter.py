@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 ET = ZoneInfo("America/New_York")
 _PRICE_SCALE = 1_000_000_000.0
+DEFAULT_DATABENTO_DATASET = "GLBX.MDP3"
+DEFAULT_DATABENTO_SCHEMA = "ohlcv-1m"
+DEFAULT_DATABENTO_STYPE_IN = "continuous"
+DEFAULT_DATABENTO_SYMBOLS = ("YM.v.0", "NQ.v.0")
 
 
 class DatabentoLiveClient:
@@ -27,8 +31,10 @@ class DatabentoLiveClient:
         self,
         *,
         api_key: str,
-        dataset: str,
-        symbols: Sequence[str],
+        dataset: str = DEFAULT_DATABENTO_DATASET,
+        schema: str = DEFAULT_DATABENTO_SCHEMA,
+        stype_in: str = DEFAULT_DATABENTO_STYPE_IN,
+        symbols: Sequence[str] = DEFAULT_DATABENTO_SYMBOLS,
         queue_maxsize: int = 2000,
         on_overload: Callable[[str], None] | None = None,
         client_factory: Callable[..., Any] | None = None,
@@ -37,10 +43,16 @@ class DatabentoLiveClient:
             raise ValueError("api_key is required")
         if not dataset:
             raise ValueError("dataset is required")
+        if not schema:
+            raise ValueError("schema is required")
+        if not stype_in:
+            raise ValueError("stype_in is required")
         if not symbols:
             raise ValueError("at least one symbol is required")
         self._api_key = api_key
         self._dataset = dataset
+        self._schema = schema
+        self._stype_in = stype_in
         self._symbols = tuple(symbols)
         self._queue = BackpressureQueue(maxsize=queue_maxsize)
         self._on_overload = on_overload
@@ -58,12 +70,22 @@ class DatabentoLiveClient:
         self._loop = asyncio.get_running_loop()
         self._stop_requested = False
 
+        logger.info(
+            "Starting Databento live feed dataset=%s schema=%s stype_in=%s symbols=%s",
+            self._dataset,
+            self._schema,
+            self._stype_in,
+            list(self._symbols),
+        )
         client = self._build_client()
         client.add_callback(self._handle_record, self._handle_callback_error)
         client.add_reconnect_callback(self._handle_reconnect, self._handle_callback_error)
-        self._subscribe(client)
-        self._client = client
-        client.start()
+        try:
+            self._subscribe(client)
+            self._client = client
+            client.start()
+        except Exception as exc:
+            raise RuntimeError(_format_startup_error(exc)) from exc
         self._close_task = asyncio.create_task(self._wait_for_close(), name="databento-live-close")
 
     async def stop(self) -> None:
@@ -111,36 +133,21 @@ class DatabentoLiveClient:
         stype_in = self._resolve_stype_in()
         client.subscribe(
             dataset=self._dataset,
-            schema="ohlcv-1m",
+            schema=self._schema,
             symbols=list(self._symbols),
             stype_in=stype_in,
         )
-        try:
-            client.subscribe(
-                dataset=self._dataset,
-                schema="bbo-1s",
-                symbols=list(self._symbols),
-                stype_in=stype_in,
-            )
-            self._quote_schema_enabled = True
-        except Exception as exc:  # pragma: no cover - exercised in tests via fake client
-            self._quote_schema_enabled = False
-            logger.warning("Databento quote subscription unavailable; continuing on bars only: %s", exc)
-            self._schedule_message(
-                FeedMessage(
-                    type="event",
-                    timestamp_et=datetime.now(tz=ET),
-                    symbol="*",
-                    payload={"code": "QUOTE_SCHEMA_UNAVAILABLE", "detail": str(exc)},
-                )
-            )
+        self._quote_schema_enabled = False
 
     def _resolve_stype_in(self) -> Any:
         if self._client_factory is not None:
-            return "parent"
+            return self._stype_in
         import databento as db
 
-        return db.SType.PARENT
+        try:
+            return getattr(db.SType, self._stype_in.upper())
+        except AttributeError:
+            return self._stype_in
 
     async def _wait_for_close(self) -> None:
         if self._client is None:
@@ -150,13 +157,14 @@ class DatabentoLiveClient:
             await self._client.wait_for_close()
         except Exception as exc:
             if not self._stop_requested:
-                logger.warning("Databento live session closed unexpectedly: %s", exc)
+                code = _classify_databento_issue(str(exc), default="DATABENTO_CONNECTION_RESET")
+                logger.warning("Databento live session closed code=%s detail=%s", code, exc)
                 self._schedule_message(
                     FeedMessage(
                         type="event",
                         timestamp_et=datetime.now(tz=ET),
                         symbol="*",
-                        payload={"code": "DATABENTO_DISCONNECTED", "detail": str(exc)},
+                        payload={"code": code, "detail": str(exc)},
                     )
                 )
         finally:
@@ -168,6 +176,7 @@ class DatabentoLiveClient:
             self._schedule_message(message)
 
     def _handle_reconnect(self, last_ts: Any, new_start: Any) -> None:
+        logger.info("Databento reconnect last_ts=%s new_start=%s", last_ts, new_start)
         self._schedule_message(
             FeedMessage(
                 type="event",
@@ -182,13 +191,22 @@ class DatabentoLiveClient:
         )
 
     def _handle_callback_error(self, exc: Exception) -> None:
-        logger.warning("Databento callback error: %s", exc)
+        code = _classify_databento_issue(str(exc), default="DATABENTO_CALLBACK_ERROR")
+        logger.warning("Databento callback error code=%s detail=%s", code, exc)
+        self._schedule_message(
+            FeedMessage(
+                type="event",
+                timestamp_et=datetime.now(tz=ET),
+                symbol="*",
+                payload={"code": code, "detail": str(exc)},
+            )
+        )
 
     def _normalize_record(self, record: Any) -> FeedMessage | None:
         import databento_dbn as dbn
 
         if isinstance(record, dbn.SymbolMappingMsg):
-            self._symbol_map[int(record.instrument_id)] = str(record.stype_in_symbol)
+            self._symbol_map[int(record.instrument_id)] = _normalize_strategy_symbol(str(record.stype_in_symbol))
             return None
         if isinstance(record, dbn.OHLCVMsg):
             symbol = self._resolve_symbol(record.instrument_id)
@@ -220,18 +238,26 @@ class DatabentoLiveClient:
                 payload=quote,
             )
         if isinstance(record, dbn.SystemMsg):
+            detail = str(record.msg)
             return FeedMessage(
                 type="event",
                 timestamp_et=_ts_to_et(record.ts_event),
                 symbol="*",
-                payload={"code": f"DATABENTO_SYSTEM_{record.code}", "detail": str(record.msg)},
+                payload={
+                    "code": _classify_databento_issue(detail, default=f"DATABENTO_SYSTEM_{record.code}"),
+                    "detail": detail,
+                },
             )
         if isinstance(record, dbn.ErrorMsg):
+            detail = str(record.err)
             return FeedMessage(
                 type="event",
                 timestamp_et=_ts_to_et(record.ts_event),
                 symbol="*",
-                payload={"code": f"DATABENTO_ERROR_{record.code}", "detail": str(record.err)},
+                payload={
+                    "code": _classify_databento_issue(detail, default=f"DATABENTO_ERROR_{record.code}"),
+                    "detail": detail,
+                },
             )
         return None
 
@@ -242,7 +268,7 @@ class DatabentoLiveClient:
         if self._client is not None:
             mapped = self._client.symbology_map.get(int(instrument_id))
             if mapped is not None:
-                symbol = str(mapped)
+                symbol = _normalize_strategy_symbol(str(mapped))
                 self._symbol_map[int(instrument_id)] = symbol
                 return symbol
         logger.debug("Dropping Databento record for unknown instrument_id=%s", instrument_id)
@@ -297,3 +323,50 @@ def _price_to_float(value: int) -> float | None:
 
 def _ts_to_et(ts_event_ns: int) -> datetime:
     return datetime.fromtimestamp(int(ts_event_ns) / 1_000_000_000, tz=timezone.utc).astimezone(ET)
+
+
+def _normalize_strategy_symbol(symbol: str) -> str:
+    head, dot, _tail = symbol.partition(".")
+    if dot and head:
+        return head
+    return symbol
+
+
+def _format_startup_error(exc: Exception) -> str:
+    code = _classify_databento_issue(str(exc), default="DATABENTO_STARTUP_FAILURE")
+    if code == "DATABENTO_AUTH_FAILURE":
+        return f"Databento authentication failed: {exc}"
+    if code == "DATABENTO_SYMBOL_RESOLUTION_FAILURE":
+        return f"Databento symbol resolution failed: {exc}"
+    if code == "DATABENTO_ENTITLEMENT_FAILURE":
+        return f"Databento entitlement or subscription failed: {exc}"
+    if code == "DATABENTO_CONNECTION_RESET":
+        return f"Databento connection reset during startup: {exc}"
+    return f"Databento live startup failed: {exc}"
+
+
+def _classify_databento_issue(detail: str, *, default: str) -> str:
+    text = detail.lower()
+    if any(token in text for token in ("auth", "unauthorized", "forbidden", "api key", "credential", "invalid key")):
+        return "DATABENTO_AUTH_FAILURE"
+    if any(
+        token in text
+        for token in (
+            "symbol resolution",
+            "resolve symbol",
+            "unknown symbol",
+            "symbol not found",
+            "invalid symbol",
+            "symbology",
+            "stype_in",
+        )
+    ):
+        return "DATABENTO_SYMBOL_RESOLUTION_FAILURE"
+    if any(token in text for token in ("entitlement", "not entitled", "subscription", "schema", "dataset permission")):
+        return "DATABENTO_ENTITLEMENT_FAILURE"
+    if any(
+        token in text
+        for token in ("connection reset", "connection closed", "broken pipe", "econnreset", "disconnected", "reconnect")
+    ):
+        return "DATABENTO_CONNECTION_RESET"
+    return default

@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 
 import databento as db
 import databento_dbn as dbn
+import pytest
 
-from futures_bot.live.databento_adapter import DatabentoLiveClient
+from futures_bot.live.databento_adapter import (
+    DEFAULT_DATABENTO_DATASET,
+    DEFAULT_DATABENTO_SCHEMA,
+    DEFAULT_DATABENTO_STYPE_IN,
+    DEFAULT_DATABENTO_SYMBOLS,
+    DatabentoLiveClient,
+)
 
 
 @dataclass
 class FakeLiveSession:
-    fail_quote_schema: bool = False
-
     def __post_init__(self) -> None:
         self.callbacks: list[tuple[object, object | None]] = []
         self.reconnect_callbacks: list[tuple[object, object | None]] = []
@@ -29,8 +35,6 @@ class FakeLiveSession:
         self.reconnect_callbacks.append((callback, exception_callback))
 
     def subscribe(self, **kwargs) -> None:
-        if self.fail_quote_schema and kwargs.get("schema") == "bbo-1s":
-            raise ValueError("quote schema unavailable")
         self.subscribe_calls.append(kwargs)
 
     def start(self) -> None:
@@ -44,21 +48,27 @@ class FakeLiveSession:
         await self._closed.wait()
 
 
-def test_databento_client_initializes_and_normalizes_records() -> None:
+def test_databento_client_uses_continuous_bars_only_defaults_and_normalizes_records(caplog: pytest.LogCaptureFixture) -> None:
     async def scenario() -> None:
         session = FakeLiveSession()
         client = DatabentoLiveClient(
             api_key="db-key",
-            dataset="GLBX.MDP3",
-            symbols=["ES"],
             client_factory=lambda **_: session,
         )
 
-        await client.start()
+        with caplog.at_level(logging.INFO):
+            await client.start()
 
         assert session.started is True
-        assert [call["schema"] for call in session.subscribe_calls] == ["ohlcv-1m", "bbo-1s"]
-        assert all(call["stype_in"] == "parent" for call in session.subscribe_calls)
+        assert session.subscribe_calls == [
+            {
+                "dataset": DEFAULT_DATABENTO_DATASET,
+                "schema": DEFAULT_DATABENTO_SCHEMA,
+                "symbols": list(DEFAULT_DATABENTO_SYMBOLS),
+                "stype_in": DEFAULT_DATABENTO_STYPE_IN,
+            }
+        ]
+        assert "dataset=GLBX.MDP3 schema=ohlcv-1m stype_in=continuous symbols=['YM.v.0', 'NQ.v.0']" in caplog.text
 
         callback, _ = session.callbacks[0]
         ts_event = 1_736_688_600_000_000_000
@@ -67,10 +77,10 @@ def test_databento_client_initializes_and_normalizes_records() -> None:
                 1,
                 101,
                 ts_event,
-                db.SType.PARENT,
-                "ES",
+                db.SType.CONTINUOUS,
+                "YM.v.0",
                 db.SType.RAW_SYMBOL,
-                "ESH6",
+                "YMH6",
                 ts_event,
                 ts_event,
             )
@@ -105,19 +115,11 @@ def test_databento_client_initializes_and_normalizes_records() -> None:
 
         messages = client.messages()
         bar = await anext(messages)
-        quote = await anext(messages)
 
         assert bar.type == "bar_1m"
-        assert bar.symbol == "ES"
+        assert bar.symbol == "YM"
         assert bar.payload["open"] == 5.0
         assert bar.payload["close"] == 5.05
-
-        assert quote.type == "quote_1s"
-        assert quote.symbol == "ES"
-        assert quote.payload["bid"] == 5.0
-        assert quote.payload["ask"] == 5.025
-        assert quote.payload["bid_size"] == 7.0
-        assert quote.payload["ask_size"] == 9.0
 
         await client.stop()
         assert session.stopped is True
@@ -125,22 +127,29 @@ def test_databento_client_initializes_and_normalizes_records() -> None:
     asyncio.run(scenario())
 
 
-def test_databento_client_degrades_gracefully_without_quote_schema() -> None:
+def test_databento_client_classifies_symbol_resolution_errors() -> None:
     async def scenario() -> None:
-        session = FakeLiveSession(fail_quote_schema=True)
+        session = FakeLiveSession()
         client = DatabentoLiveClient(
             api_key="db-key",
-            dataset="GLBX.MDP3",
-            symbols=["ES"],
             client_factory=lambda **_: session,
         )
 
         await client.start()
 
+        callback, _ = session.callbacks[0]
+        callback(
+            dbn.ErrorMsg(
+                1_736_688_600_000_000_000,
+                "symbol resolution failed for subscription",
+            )
+        )
+        await asyncio.sleep(0)
+
         messages = client.messages()
         event = await anext(messages)
         assert event.type == "event"
-        assert event.payload["code"] == "QUOTE_SCHEMA_UNAVAILABLE"
+        assert event.payload["code"] == "DATABENTO_SYMBOL_RESOLUTION_FAILURE"
         assert client.quote_schema_enabled is False
 
         await client.stop()

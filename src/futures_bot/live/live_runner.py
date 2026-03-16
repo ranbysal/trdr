@@ -6,17 +6,26 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+import logging
 from pathlib import Path
 from typing import Any
 
 from futures_bot.core.enums import Regime, StrategyModule
 from futures_bot.core.types import InstrumentMeta
-from futures_bot.live.databento_adapter import DatabentoLiveClient
+from futures_bot.live.databento_adapter import (
+    DEFAULT_DATABENTO_DATASET,
+    DEFAULT_DATABENTO_SCHEMA,
+    DEFAULT_DATABENTO_STYPE_IN,
+    DEFAULT_DATABENTO_SYMBOLS,
+    DatabentoLiveClient,
+)
 from futures_bot.live.feed_models import FeedMessage
 from futures_bot.live.ws_client import LiveWsClient
 from futures_bot.alerts.telegram import TelegramNotifier
 from futures_bot.pipeline.multistrategy_signals import MultiStrategySignalEngine
 from futures_bot.runtime.ndjson_writer import NdjsonWriter
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -52,7 +61,10 @@ class LiveSignalRunner:
         notifier: TelegramNotifier | None = None,
         queue_maxsize: int = 2000,
         databento_api_key: str | None = None,
-        databento_dataset: str = "GLBX.MDP3",
+        databento_dataset: str = DEFAULT_DATABENTO_DATASET,
+        databento_schema: str = DEFAULT_DATABENTO_SCHEMA,
+        databento_stype_in: str = DEFAULT_DATABENTO_STYPE_IN,
+        databento_symbols: tuple[str, ...] = DEFAULT_DATABENTO_SYMBOLS,
         ws_url: str | None = None,
     ) -> None:
         out_path = Path(out_dir)
@@ -70,6 +82,9 @@ class LiveSignalRunner:
         self._client = feed_client or self._build_client(
             databento_api_key=databento_api_key,
             databento_dataset=databento_dataset,
+            databento_schema=databento_schema,
+            databento_stype_in=databento_stype_in,
+            databento_symbols=databento_symbols,
             instruments_by_symbol=instruments_by_symbol,
             queue_maxsize=queue_maxsize,
             ws_url=ws_url,
@@ -305,15 +320,27 @@ class LiveSignalRunner:
         *,
         databento_api_key: str | None,
         databento_dataset: str,
+        databento_schema: str,
+        databento_stype_in: str,
+        databento_symbols: tuple[str, ...],
         instruments_by_symbol: dict[str, InstrumentMeta],
         queue_maxsize: int,
         ws_url: str | None,
     ) -> Any:
         if databento_api_key:
+            logger.info(
+                "Configuring Databento live client dataset=%s schema=%s stype_in=%s symbols=%s",
+                databento_dataset,
+                databento_schema,
+                databento_stype_in,
+                list(databento_symbols),
+            )
             return DatabentoLiveClient(
                 api_key=databento_api_key,
                 dataset=databento_dataset,
-                symbols=sorted(instruments_by_symbol),
+                schema=databento_schema,
+                stype_in=databento_stype_in,
+                symbols=databento_symbols,
                 queue_maxsize=queue_maxsize,
                 on_overload=self._on_overload,
             )
@@ -335,7 +362,10 @@ async def run_live_signals(
     max_messages: int | None = None,
     max_runtime_s: float | None = None,
     databento_api_key: str | None = None,
-    databento_dataset: str = "GLBX.MDP3",
+    databento_dataset: str = DEFAULT_DATABENTO_DATASET,
+    databento_schema: str = DEFAULT_DATABENTO_SCHEMA,
+    databento_stype_in: str = DEFAULT_DATABENTO_STYPE_IN,
+    databento_symbols: tuple[str, ...] = DEFAULT_DATABENTO_SYMBOLS,
     feed_client: Any | None = None,
     ws_url: str | None = None,
 ) -> None:
@@ -347,6 +377,9 @@ async def run_live_signals(
         notifier=notifier,
         databento_api_key=databento_api_key,
         databento_dataset=databento_dataset,
+        databento_schema=databento_schema,
+        databento_stype_in=databento_stype_in,
+        databento_symbols=databento_symbols,
         ws_url=ws_url,
     )
     await runner.run(max_messages=max_messages, max_runtime_s=max_runtime_s)
