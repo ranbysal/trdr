@@ -6,6 +6,7 @@ import json
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from typing import Any
 
 from futures_bot.signals.models import AlertKind, SignalIdea, SignalLifecycleState
 
@@ -36,6 +37,10 @@ class TelegramNotifier:
     def enabled(self) -> bool:
         return bool(self._token and self._chat_id)
 
+    @property
+    def chat_id(self) -> str:
+        return str(self._chat_id or "")
+
     def send(
         self,
         *,
@@ -45,32 +50,61 @@ class TelegramNotifier:
         note: str | None = None,
     ) -> TelegramDelivery:
         message = self.format(kind=kind, idea=idea, state=state, note=note)
-        if not self.enabled:
-            return TelegramDelivery(delivered=False, message=message, error="telegram_not_configured")
+        return self.send_text(text=message)
 
-        payload = json.dumps(
-            {
-                "chat_id": self._chat_id,
-                "text": message,
-                "parse_mode": self._parse_mode,
-                "disable_web_page_preview": True,
-            }
-        ).encode("utf-8")
+    def send_text(self, *, text: str) -> TelegramDelivery:
+        if not self.enabled:
+            return TelegramDelivery(delivered=False, message=text, error="telegram_not_configured")
+
+        try:
+            response = self._post(
+                method="sendMessage",
+                payload={
+                    "chat_id": self._chat_id,
+                    "text": text,
+                    "parse_mode": self._parse_mode,
+                    "disable_web_page_preview": True,
+                },
+            )
+            return TelegramDelivery(
+                delivered=True,
+                message=text,
+                response_code=response.get("response_code"),
+            )
+        except urllib.error.URLError as exc:
+            return TelegramDelivery(delivered=False, message=text, error=str(exc))
+
+    def fetch_updates(self, *, offset: int | None = None, timeout_s: int = 1) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        try:
+            response = self._post(
+                method="getUpdates",
+                payload={
+                    "offset": offset,
+                    "timeout": timeout_s,
+                    "allowed_updates": ["message"],
+                },
+            )
+        except urllib.error.URLError:
+            return []
+        result = response.get("result", [])
+        return result if isinstance(result, list) else []
+
+    def _post(self, *, method: str, payload: dict[str, Any]) -> dict[str, Any]:
         request = urllib.request.Request(
-            url=f"https://api.telegram.org/bot{self._token}/sendMessage",
-            data=payload,
+            url=f"https://api.telegram.org/bot{self._token}/{method}",
+            data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self._timeout_s) as response:
-                return TelegramDelivery(
-                    delivered=True,
-                    message=message,
-                    response_code=getattr(response, "status", None),
-                )
-        except urllib.error.URLError as exc:
-            return TelegramDelivery(delivered=False, message=message, error=str(exc))
+        with urllib.request.urlopen(request, timeout=self._timeout_s) as response:
+            body = response.read()
+            parsed = json.loads(body.decode("utf-8")) if body else {}
+            if isinstance(parsed, dict):
+                parsed["response_code"] = getattr(response, "status", None)
+                return parsed
+            return {"response_code": getattr(response, "status", None)}
 
     def format(
         self,

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from futures_bot.alerts.telegram import TelegramNotifier
+from futures_bot.alerts.telegram import TelegramDelivery, TelegramNotifier
 from futures_bot.runtime.ndjson_writer import NdjsonWriter
 from futures_bot.signals.models import AlertKind, SignalIdea, SignalLifecycleState
 
@@ -19,10 +20,12 @@ class AlertStateManager:
         *,
         out_dir: str | Path,
         notifier: TelegramNotifier | None = None,
+        on_emit: Callable[[SignalIdea, AlertKind, SignalLifecycleState, TelegramDelivery], None] | None = None,
     ) -> None:
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
         self._notifier = notifier or TelegramNotifier()
+        self._on_emit = on_emit
         self._event_log = NdjsonWriter(out_path / "signal_events.ndjson")
         self._snapshot_path = out_path / "active_ideas.json"
         self._active: dict[str, SignalIdea] = {}
@@ -54,6 +57,23 @@ class AlertStateManager:
             if idea.pair_hedge_symbol:
                 symbols.add(idea.pair_hedge_symbol)
         return symbols
+
+    def active_count(self) -> int:
+        return sum(1 for idea in self._active.values() if not idea.closed)
+
+    def snapshot_records(self) -> list[dict[str, Any]]:
+        return [self._snapshot_record(idea) for idea in self._active.values() if not idea.closed]
+
+    def restore(self, records: list[dict[str, Any]]) -> None:
+        restored: dict[str, SignalIdea] = {}
+        for record in records:
+            try:
+                idea = self._idea_from_record(record)
+            except (KeyError, TypeError, ValueError):
+                continue
+            restored[idea.key] = idea
+        self._active = restored
+        self._persist_snapshot()
 
     def process_market(
         self,
@@ -292,14 +312,21 @@ class AlertStateManager:
                 "note": note,
             }
         )
+        if self._on_emit is not None:
+            self._on_emit(idea, kind, state, delivery)
 
     def _close(self, idea: SignalIdea) -> None:
         idea.closed = True
         self._active.pop(idea.key, None)
 
     def _persist_snapshot(self) -> None:
-        records = [self._snapshot_record(idea) for idea in self._active.values() if not idea.closed]
-        self._snapshot_path.write_text(json.dumps(records, indent=2, sort_keys=True), encoding="utf-8")
+        records = self.snapshot_records()
+        tmp_path = self._snapshot_path.with_suffix(f"{self._snapshot_path.suffix}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(records, indent=2, sort_keys=True))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, self._snapshot_path)
 
     def _snapshot_record(self, idea: SignalIdea) -> dict[str, Any]:
         payload = asdict(idea)
@@ -309,6 +336,45 @@ class AlertStateManager:
         payload["timestamp"] = idea.timestamp.isoformat()
         payload["flatten_by"] = idea.flatten_by.isoformat()
         return payload
+
+    def _idea_from_record(self, payload: dict[str, Any]) -> SignalIdea:
+        return SignalIdea(
+            idea_id=str(payload["idea_id"]),
+            strategy=self._strategy_from_value(str(payload["strategy"])),
+            symbol=str(payload["symbol"]),
+            symbol_display=str(payload["symbol_display"]),
+            side=str(payload["side"]),
+            entry_low=float(payload["entry_low"]),
+            entry_high=float(payload["entry_high"]),
+            stop_loss=float(payload["stop_loss"]),
+            tp1=float(payload["tp1"]),
+            tp2=float(payload["tp2"]),
+            invalidation=str(payload["invalidation"]),
+            partial_profit_guidance=str(payload["partial_profit_guidance"]),
+            timestamp=datetime.fromisoformat(str(payload["timestamp"])),
+            flatten_by=datetime.fromisoformat(str(payload["flatten_by"])),
+            regime=str(payload["regime"]),
+            confidence=float(payload["confidence"]),
+            strategy_context=str(payload["strategy_context"]),
+            last_price=float(payload["last_price"]),
+            pair_hedge_symbol=str(payload["pair_hedge_symbol"]) if payload.get("pair_hedge_symbol") is not None else None,
+            pair_beta=float(payload.get("pair_beta", 0.0)),
+            pair_stop_proxy=float(payload.get("pair_stop_proxy", 0.0)),
+            current_state=SignalLifecycleState(str(payload.get("current_state", SignalLifecycleState.IN_POSITION_ASSUMED_FALSE.value))),
+            closed=bool(payload.get("closed", False)),
+            entry_seen=bool(payload.get("entry_seen", False)),
+            partial_sent=bool(payload.get("partial_sent", False)),
+            breakeven_sent=bool(payload.get("breakeven_sent", False)),
+            extension_sent=bool(payload.get("extension_sent", False)),
+            state_history=[
+                SignalLifecycleState(str(item)) for item in list(payload.get("state_history", []))
+            ],
+        )
+
+    def _strategy_from_value(self, value: str):
+        from futures_bot.core.enums import StrategyModule
+
+        return StrategyModule(value)
 
     def _touched_entry_zone(self, *, idea: SignalIdea, high: float, low: float) -> bool:
         return low <= idea.entry_high and high >= idea.entry_low

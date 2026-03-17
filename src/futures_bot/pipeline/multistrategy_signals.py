@@ -6,7 +6,7 @@ import csv
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -57,6 +57,9 @@ class _MarketRow:
     raw_regime: Regime
     is_weak_neutral: bool
     confidence: float
+    market_open: bool = True
+    signals_active: bool = True
+    schedule_state: str = "open"
 
 
 @dataclass(slots=True)
@@ -111,12 +114,16 @@ class MultiStrategySignalEngine:
         instruments_by_symbol: dict[str, InstrumentMeta],
         enabled_strategies: set[StrategyModule],
         notifier: TelegramNotifier | None = None,
+        alert_emit_callback: Callable[..., None] | None = None,
+        signal_register_callback: Callable[[SignalIdea], None] | None = None,
     ) -> None:
         self._runner = _MultiStrategySignalRunner(
             out_dir=Path(out_dir),
             instruments_by_symbol=instruments_by_symbol,
             enabled_strategies=enabled_strategies,
             notifier=notifier,
+            alert_emit_callback=alert_emit_callback,
+            signal_register_callback=signal_register_callback,
         )
 
     def process_row(self, row: dict[str, Any] | _MarketRow) -> None:
@@ -128,6 +135,15 @@ class MultiStrategySignalEngine:
     def flush(self) -> None:
         self._runner.flush()
 
+    def active_count(self) -> int:
+        return self._runner.active_count()
+
+    def snapshot_records(self) -> list[dict[str, Any]]:
+        return self._runner.snapshot_records()
+
+    def restore(self, records: list[dict[str, Any]]) -> None:
+        self._runner.restore(records)
+
 
 class _MultiStrategySignalRunner:
     def __init__(
@@ -137,21 +153,35 @@ class _MultiStrategySignalRunner:
         instruments_by_symbol: dict[str, InstrumentMeta],
         enabled_strategies: set[StrategyModule],
         notifier: TelegramNotifier | None,
+        alert_emit_callback: Callable[..., None] | None,
+        signal_register_callback: Callable[[SignalIdea], None] | None,
     ) -> None:
         self._debug_log = NdjsonWriter(out_dir / "signal_engine.ndjson")
-        self._state = AlertStateManager(out_dir=out_dir, notifier=notifier)
+        self._state = AlertStateManager(out_dir=out_dir, notifier=notifier, on_emit=alert_emit_callback)
         self._instruments = instruments_by_symbol
         self._enabled = enabled_strategies
+        self._signal_register_callback = signal_register_callback
         self._a = StrategyAORB()
         self._b = StrategyBVWAPReversion()
         self._c = StrategyCMetalsORB()
         self._family_freeze: dict[Family, bool] = {}
         self._price_hist: dict[str, list[float]] = {}
         self._last_close: dict[str, float] = {}
+        self._window_log_keys: set[tuple[str, str, str]] = set()
+        self._rejection_log_keys: set[tuple[str, str, str, str]] = set()
 
     def flush(self) -> None:
         self._state.flush()
         self._debug_log.flush()
+
+    def active_count(self) -> int:
+        return self._state.active_count()
+
+    def snapshot_records(self) -> list[dict[str, Any]]:
+        return self._state.snapshot_records()
+
+    def restore(self, records: list[dict[str, Any]]) -> None:
+        self._state.restore(records)
 
     def step(self, row: _MarketRow) -> None:
         self._price_hist.setdefault(row.symbol, []).append(row.close)
@@ -177,6 +207,13 @@ class _MultiStrategySignalRunner:
             latest_prices=self._last_close,
         )
 
+        if not row.market_open:
+            self._log_strategy_rejections(row=row, reason_code=f"MARKET_{row.schedule_state.upper()}")
+            return
+        if not row.signals_active:
+            self._log_strategy_rejections(row=row, reason_code="SIGNALS_PAUSED")
+            return
+
         plans = self._collect_candidate_plans(row, instrument)
         if not plans:
             return
@@ -190,17 +227,42 @@ class _MultiStrategySignalRunner:
                 continue
             self._debug_log.write(
                 {
-                    "ts": row.ts.isoformat(),
-                    "event": "signal_rejected",
-                    "reason": decision.reason_code,
+                    "event": "SIGNAL_CANDIDATE_REJECTED",
+                    "reason_code": decision.reason_code,
+                    "score": decision.candidate.score,
                     "strategy": decision.candidate.strategy.value,
+                    "symbol": "/".join(decision.candidate.symbols),
+                    "timestamp_et": row.ts.isoformat(),
+                }
+            )
+            self._debug_log.write(
+                {
+                    "event": "REJECTION_REASON",
+                    "reason_code": decision.reason_code,
+                    "score": decision.candidate.score,
+                    "strategy": decision.candidate.strategy.value,
+                    "symbol": "/".join(decision.candidate.symbols),
+                    "timestamp_et": row.ts.isoformat(),
                     "symbols": list(decision.candidate.symbols),
                 }
             )
         for plan in plans:
             if (plan.candidate.strategy, plan.candidate.symbols) not in selected_set:
                 continue
-            self._state.register(self._build_idea(plan=plan, row=row, instrument=instrument))
+            self._debug_log.write(
+                {
+                    "event": "SIGNAL_CANDIDATE_ACCEPTED",
+                    "reason_code": None,
+                    "score": plan.candidate.score,
+                    "strategy": plan.candidate.strategy.value,
+                    "symbol": "/".join(plan.candidate.symbols),
+                    "timestamp_et": row.ts.isoformat(),
+                }
+            )
+            idea = self._build_idea(plan=plan, row=row, instrument=instrument)
+            self._state.register(idea)
+            if self._signal_register_callback is not None:
+                self._signal_register_callback(idea)
 
     def _collect_candidate_plans(self, row: _MarketRow, instrument: InstrumentMeta) -> list[_CandidatePlan]:
         plans: list[_CandidatePlan] = []
@@ -211,27 +273,39 @@ class _MultiStrategySignalRunner:
         if StrategyModule.STRAT_A_ORB in self._enabled:
             gate = self._global_gate(row=row, family=instrument.family)
             if gate is None:
+                self._log_window_active(row=row, strategy=StrategyModule.STRAT_A_ORB)
                 plan = self._evaluate_a(row=row, bar=bar, instrument=instrument)
                 if plan is not None:
                     plans.append(plan)
+            else:
+                self._log_rejection(row=row, strategy=StrategyModule.STRAT_A_ORB, reason_code=gate)
         if StrategyModule.STRAT_B_VWAP_REV in self._enabled:
             gate = self._global_gate(row=row, family=instrument.family)
             if gate is None:
+                self._log_window_active(row=row, strategy=StrategyModule.STRAT_B_VWAP_REV)
                 plan = self._evaluate_b(row=row, instrument=instrument)
                 if plan is not None:
                     plans.append(plan)
+            else:
+                self._log_rejection(row=row, strategy=StrategyModule.STRAT_B_VWAP_REV, reason_code=gate)
         if StrategyModule.STRAT_C_METALS_ORB in self._enabled and row.symbol == "MGC":
             gate = self._global_gate(row=row, family=instrument.family)
             if gate is None:
+                self._log_window_active(row=row, strategy=StrategyModule.STRAT_C_METALS_ORB)
                 plan = self._evaluate_c(row=row, bar=bar, instrument=instrument)
                 if plan is not None:
                     plans.append(plan)
+            else:
+                self._log_rejection(row=row, strategy=StrategyModule.STRAT_C_METALS_ORB, reason_code=gate)
         if StrategyModule.STRAT_D_PAIR in self._enabled and row.symbol == "MGC":
             gate = self._global_gate(row=row, family=Family.METALS)
             if gate is None:
+                self._log_window_active(row=row, strategy=StrategyModule.STRAT_D_PAIR)
                 plan = self._evaluate_d(row=row)
                 if plan is not None:
                     plans.append(plan)
+            else:
+                self._log_rejection(row=row, strategy=StrategyModule.STRAT_D_PAIR, reason_code=gate)
         return plans
 
     def _evaluate_a(self, *, row: _MarketRow, bar: Bar1m, instrument: InstrumentMeta) -> _CandidatePlan | None:
@@ -248,9 +322,11 @@ class _MultiStrategySignalRunner:
         )
         eval_result = self._a.evaluate_breakout_candidate(bar=bar, features=features, tick_size=instrument.tick_size)
         if not eval_result.approved or eval_result.signal is None or eval_result.entry_plan is None:
+            self._log_rejection(row=row, strategy=StrategyModule.STRAT_A_ORB, reason_code="STRATEGY_RULES_NOT_MET")
             return None
         state = self._a.get_or_state(row.symbol)
         if state is None or state.or_width is None:
+            self._log_rejection(row=row, strategy=StrategyModule.STRAT_A_ORB, reason_code="OR_STATE_NOT_READY")
             return None
         pattern_quality = compute_pattern_quality(
             or_width=state.or_width,
@@ -268,6 +344,7 @@ class _MultiStrategySignalRunner:
             exec_quality=1.0,
         )
         if breakdown.action == "reject":
+            self._log_rejection(row=row, strategy=StrategyModule.STRAT_A_ORB, reason_code="SCORE_REJECT", score=breakdown.final_score)
             return None
         return _CandidatePlan(
             candidate=StrategyCandidate(
@@ -305,6 +382,7 @@ class _MultiStrategySignalRunner:
         )
         eval_result, signal = self._b.evaluate_candidate(ts=row.ts, symbol=row.symbol, features=features)
         if not eval_result.approved or signal is None:
+            self._log_rejection(row=row, strategy=StrategyModule.STRAT_B_VWAP_REV, reason_code="STRATEGY_RULES_NOT_MET")
             return None
         stop_distance = max(0.8 * row.atr_14_5m, instrument.tick_size)
         initial_stop = row.close - stop_distance if signal.side is OrderSide.BUY else row.close + stop_distance
@@ -347,6 +425,7 @@ class _MultiStrategySignalRunner:
             tick_size=instrument.tick_size,
         )
         if not eval_result.approved or signal is None or eval_result.entry_plan is None:
+            self._log_rejection(row=row, strategy=StrategyModule.STRAT_C_METALS_ORB, reason_code="STRATEGY_RULES_NOT_MET")
             return None
         plan: StrategyCEntryPlan = eval_result.entry_plan
         return _CandidatePlan(
@@ -374,6 +453,7 @@ class _MultiStrategySignalRunner:
 
     def _evaluate_d(self, *, row: _MarketRow) -> _CandidatePlan | None:
         if "MGC" not in self._price_hist or "SIL" not in self._price_hist:
+            self._log_rejection(row=row, strategy=StrategyModule.STRAT_D_PAIR, reason_code="PAIR_HISTORY_NOT_READY")
             return None
         lead_hist = self._price_hist["MGC"][-80:]
         hedge_hist = self._price_hist["SIL"][-80:]
@@ -381,6 +461,7 @@ class _MultiStrategySignalRunner:
         lead = np.asarray(lead_hist[-window:], dtype=float)
         hedge = np.asarray(hedge_hist[-window:], dtype=float)
         if lead.size < 60 or hedge.size < 60:
+            self._log_rejection(row=row, strategy=StrategyModule.STRAT_D_PAIR, reason_code="PAIR_HISTORY_NOT_READY")
             return None
         pair: PairSignal = evaluate_pair_signal(
             lead_symbol="MGC",
@@ -390,6 +471,7 @@ class _MultiStrategySignalRunner:
             data_ok=row.data_ok and row.quote_ok,
         )
         if not pair.approved:
+            self._log_rejection(row=row, strategy=StrategyModule.STRAT_D_PAIR, reason_code="STRATEGY_RULES_NOT_MET")
             return None
         score = 85.0 + min(abs(pair.zscore), 10.0)
         entry_spread = float(lead[-1] - (pair.hedge_beta * hedge[-1]))
@@ -525,6 +607,53 @@ class _MultiStrategySignalRunner:
             )
         raise KeyError(f"Unknown instrument for synthetic fallback: {symbol}")
 
+    def _log_window_active(self, *, row: _MarketRow, strategy: StrategyModule) -> None:
+        key = (row.ts.replace(second=0, microsecond=0).isoformat(), row.symbol, strategy.value)
+        if key in self._window_log_keys:
+            return
+        self._window_log_keys.add(key)
+        self._debug_log.write(
+            {
+                "event": "STRATEGY_WINDOW_ACTIVE",
+                "timestamp_et": row.ts.isoformat(),
+                "symbol": row.symbol,
+                "strategy": strategy.value,
+                "reason_code": None,
+                "score": None,
+            }
+        )
+
+    def _log_strategy_rejections(self, *, row: _MarketRow, reason_code: str) -> None:
+        for strategy in sorted(self._enabled, key=lambda item: item.value):
+            if strategy is StrategyModule.STRAT_C_METALS_ORB and row.symbol != "MGC":
+                continue
+            if strategy is StrategyModule.STRAT_D_PAIR and row.symbol != "MGC":
+                continue
+            self._log_rejection(row=row, strategy=strategy, reason_code=reason_code)
+
+    def _log_rejection(
+        self,
+        *,
+        row: _MarketRow,
+        strategy: StrategyModule,
+        reason_code: str,
+        score: float | None = None,
+    ) -> None:
+        minute_key = row.ts.replace(second=0, microsecond=0).isoformat()
+        dedupe_key = (minute_key, row.symbol, strategy.value, reason_code)
+        if dedupe_key in self._rejection_log_keys:
+            return
+        self._rejection_log_keys.add(dedupe_key)
+        payload = {
+            "timestamp_et": row.ts.isoformat(),
+            "symbol": row.symbol,
+            "strategy": strategy.value,
+            "reason_code": reason_code,
+            "score": score,
+        }
+        self._debug_log.write({"event": "SIGNAL_CANDIDATE_REJECTED", **payload})
+        self._debug_log.write({"event": "REJECTION_REASON", **payload})
+
 
 def _bar_from_row(row: _MarketRow) -> Bar1m:
     return Bar1m(
@@ -605,6 +734,9 @@ def _parse_row(raw: dict[str, str]) -> _MarketRow:
         raw_regime=_to_regime(raw.get("raw_regime", "trend")),
         is_weak_neutral=_to_bool(raw.get("is_weak_neutral", "false")),
         confidence=float(raw.get("confidence", "1.0") or 1.0),
+        market_open=_to_bool(raw.get("market_open", "true")),
+        signals_active=_to_bool(raw.get("signals_active", "true")),
+        schedule_state=str(raw.get("schedule_state", "open")),
     )
 
 
@@ -634,6 +766,9 @@ def _row_from_mapping(raw: dict[str, Any]) -> _MarketRow:
         raw_regime=_coerce_regime(raw.get("raw_regime", Regime.TREND)),
         is_weak_neutral=bool(raw.get("is_weak_neutral", False)),
         confidence=float(raw.get("confidence", 1.0)),
+        market_open=bool(raw.get("market_open", True)),
+        signals_active=bool(raw.get("signals_active", True)),
+        schedule_state=str(raw.get("schedule_state", "open")),
     )
 
 

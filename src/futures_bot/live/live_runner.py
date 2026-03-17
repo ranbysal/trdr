@@ -7,9 +7,15 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
+from futures_bot.alerts.eod_summary import EodSummaryManager
+from futures_bot.alerts.error_forwarder import ErrorForwarder
+from futures_bot.alerts.heartbeat import HeartbeatManager
+from futures_bot.alerts.telegram import TelegramDelivery, TelegramNotifier
+from futures_bot.alerts.telegram_listener import TelegramCommandListener
 from futures_bot.core.enums import Regime, StrategyModule
 from futures_bot.core.types import InstrumentMeta
 from futures_bot.live.databento_adapter import (
@@ -21,9 +27,12 @@ from futures_bot.live.databento_adapter import (
 )
 from futures_bot.live.feed_models import FeedMessage
 from futures_bot.live.ws_client import LiveWsClient
-from futures_bot.alerts.telegram import TelegramNotifier
 from futures_bot.pipeline.multistrategy_signals import MultiStrategySignalEngine
+from futures_bot.runtime.health import RuntimeHealth
 from futures_bot.runtime.ndjson_writer import NdjsonWriter
+from futures_bot.runtime.schedule import ET, schedule_state
+from futures_bot.runtime.state_store import JsonStateStore
+from futures_bot.runtime.stale_data import StaleDataEvent, StaleDataMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -69,13 +78,47 @@ class LiveSignalRunner:
     ) -> None:
         out_path = Path(out_dir)
         out_path.mkdir(parents=True, exist_ok=True)
+        self._out_path = out_path
+        self._notifier = notifier or TelegramNotifier()
         self._events_log = NdjsonWriter(out_path / "live_events.ndjson")
+        self._state_store = JsonStateStore(out_path / "runtime_state.json")
+        restored_state = self._state_store.load()
+        restored_last_bars = self._load_last_bar_state(restored_state)
+        self._health = RuntimeHealth(
+            out_dir=out_path,
+            enabled_strategies={item.value for item in enabled_strategies},
+            signals_active=bool(restored_state.get("signals_active", True)),
+        )
+        self._health.load_last_bars(restored_last_bars)
+        self._heartbeat = HeartbeatManager(
+            interval_hours=float(os.getenv("FUTURES_BOT_HEARTBEAT_HOURS", "4")),
+            last_sent_at=self._parse_datetime(restored_state.get("last_heartbeat_timestamp")),
+        )
+        self._eod = EodSummaryManager(
+            last_sent_date=self._parse_date(restored_state.get("last_eod_summary_date_sent")),
+        )
+        self._eod.restore_counters(dict(restored_state.get("daily_summary", {})))
+        self._stale_monitor = StaleDataMonitor(
+            bars_timeout_s=float(os.getenv("FUTURES_BOT_BARS_STALE_TIMEOUT_S", "180")),
+            quote_timeout_s=float(os.getenv("FUTURES_BOT_QUOTE_STALE_TIMEOUT_S", "30")),
+            last_bar_by_symbol=restored_last_bars,
+            stale_flags={str(k): bool(v) for k, v in dict(restored_state.get("stale_alert_active_flags", {})).items()},
+        )
+        self._error_forwarder = ErrorForwarder(self._notifier)
+        self._last_schedule_state: str | None = None
+        self._disconnect_events: deque[datetime] = deque(maxlen=10)
+        self._stop_event = asyncio.Event()
+        self._supervisor_task: asyncio.Task[None] | None = None
+        self._listener_task: asyncio.Task[None] | None = None
         self._engine = MultiStrategySignalEngine(
             out_dir=out_path,
             instruments_by_symbol=instruments_by_symbol,
             enabled_strategies=enabled_strategies,
-            notifier=notifier,
+            notifier=self._notifier,
+            alert_emit_callback=self._on_alert_emitted,
+            signal_register_callback=self._on_signal_registered,
         )
+        self._engine.restore(list(restored_state.get("active_ideas", [])))
         self._states: dict[str, _SymbolState] = {}
         self._global_freeze = False
         self._lockout = False
@@ -89,12 +132,22 @@ class LiveSignalRunner:
             queue_maxsize=queue_maxsize,
             ws_url=ws_url,
         )
+        self._listener = TelegramCommandListener(
+            notifier=self._notifier,
+            status_provider=self._status_message,
+            set_signals_active=self._set_signals_active,
+            poll_interval_s=float(os.getenv("FUTURES_BOT_TELEGRAM_POLL_INTERVAL_S", "2")),
+        )
 
     async def run(self, *, max_messages: int | None = None, max_runtime_s: float | None = None) -> None:
-        await self._client.start()
-        processed = 0
-        started = asyncio.get_event_loop().time()
         try:
+            await self._client.start()
+            self._health.set_feed_connected(True)
+            self._persist_state()
+            self._supervisor_task = asyncio.create_task(self._supervise(), name="live-signal-supervisor")
+            self._listener_task = asyncio.create_task(self._listener.run(self._stop_event), name="telegram-command-listener")
+            processed = 0
+            started = asyncio.get_event_loop().time()
             async for message in self._client.messages():
                 await self._handle_message(message)
                 processed += 1
@@ -102,8 +155,31 @@ class LiveSignalRunner:
                     break
                 if max_runtime_s is not None and (asyncio.get_event_loop().time() - started) >= max_runtime_s:
                     break
+        except Exception as exc:
+            logger.exception("Live signal runner failed")
+            self._write_telegram_event(
+                self._error_forwarder.send(
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    timestamp_et=datetime.now(tz=ET),
+                    component=__name__,
+                    dedupe_key=f"fatal:{type(exc).__name__}:{str(exc)}",
+                ),
+                timestamp_et=datetime.now(tz=ET),
+                symbol="*",
+                strategy="runtime",
+                reason_code="FATAL_ERROR",
+            )
+            raise
         finally:
+            self._stop_event.set()
+            if self._listener_task is not None:
+                await asyncio.gather(self._listener_task, return_exceptions=True)
+            if self._supervisor_task is not None:
+                await asyncio.gather(self._supervisor_task, return_exceptions=True)
             await self._client.stop()
+            self._health.set_feed_connected(False)
+            self._persist_state()
             self._engine.flush()
             self._events_log.flush()
 
@@ -119,6 +195,9 @@ class LiveSignalRunner:
     def _handle_quote(self, message: FeedMessage) -> None:
         state = self._state_for(message.symbol)
         state.last_quote_ts = message.timestamp_et
+        self._health.set_feed_connected(True)
+        for event in self._stale_monitor.mark_quote(message.symbol, message.timestamp_et):
+            self._handle_stale_event(event, now_et=message.timestamp_et)
 
     def _handle_event(self, message: FeedMessage) -> None:
         code = str(message.payload.get("code", "EVENT"))
@@ -130,14 +209,40 @@ class LiveSignalRunner:
             self._global_freeze = True
         elif code == "FREEZE_OFF":
             self._global_freeze = False
+        if code == "DATABENTO_RECONNECTED":
+            self._health.set_feed_connected(True)
+            self._error_forwarder.clear("disconnect-loop")
+        elif code.startswith("DATABENTO_"):
+            self._health.set_feed_connected(False)
+            self._record_feed_issue(message.timestamp_et)
+            if code in {"DATABENTO_CONNECTION_RESET", "DATABENTO_CALLBACK_ERROR"}:
+                self._disconnect_events.append(message.timestamp_et)
+                self._check_disconnect_loop(now_et=message.timestamp_et)
+            if code in {"DATABENTO_AUTH_FAILURE", "DATABENTO_ENTITLEMENT_FAILURE", "DATABENTO_SYMBOL_RESOLUTION_FAILURE"}:
+                self._write_telegram_event(
+                    self._error_forwarder.send(
+                        error_type=code,
+                        message=str(message.payload.get("detail", code)),
+                        timestamp_et=message.timestamp_et,
+                        component="databento_adapter",
+                        dedupe_key=f"feed-startup:{code}",
+                    ),
+                    timestamp_et=message.timestamp_et,
+                    symbol=message.symbol,
+                    strategy="runtime",
+                    reason_code=code,
+                )
         self._events_log.write(
             {
-                "ts": message.timestamp_et.isoformat(),
+                "timestamp_et": message.timestamp_et.isoformat(),
                 "event": "feed_event",
-                "code": code,
+                "reason_code": code,
                 "symbol": message.symbol,
+                "strategy": "runtime",
+                "score": None,
             }
         )
+        self._persist_state()
 
     def _handle_bar(self, message: FeedMessage) -> None:
         symbol = message.symbol
@@ -163,14 +268,31 @@ class LiveSignalRunner:
                 self._global_freeze = True
                 self._events_log.write(
                     {
-                        "ts": bar_ts.isoformat(),
+                        "timestamp_et": bar_ts.isoformat(),
                         "event": "risk_event",
-                        "code": "DATA_GAP_DETECTED",
+                        "reason_code": "DATA_GAP_DETECTED",
                         "symbol": symbol,
+                        "strategy": "runtime",
+                        "score": None,
                         "gap_seconds": gap_s,
                     }
                 )
+                self._record_feed_issue(bar_ts)
         state.last_bar_ts = bar_ts
+        self._health.mark_bar(symbol, bar_ts)
+        self._health.set_feed_connected(True)
+        for event in self._stale_monitor.mark_bar(symbol, bar_ts):
+            self._handle_stale_event(event, now_et=bar_ts)
+        self._events_log.write(
+            {
+                "event": "BAR_RECEIVED",
+                "timestamp_et": bar_ts.isoformat(),
+                "symbol": symbol,
+                "strategy": "runtime",
+                "reason_code": None,
+                "score": None,
+            }
+        )
 
         quote_required = bool(getattr(self._client, "quote_schema_enabled", True))
         quote_ok = (not quote_required) or (
@@ -190,6 +312,7 @@ class LiveSignalRunner:
         elif ema9_5m < ema21_5m:
             raw_regime = Regime.CHOP
         is_weak_neutral = raw_regime is Regime.NEUTRAL and abs(bar_close - session_vwap) <= (0.3 * atr_14_5m)
+        state_name = schedule_state(bar_ts)
 
         row = {
             "ts": bar_ts,
@@ -215,8 +338,12 @@ class LiveSignalRunner:
             "raw_regime": raw_regime,
             "is_weak_neutral": is_weak_neutral,
             "confidence": 0.5 if is_weak_neutral else 1.0,
+            "market_open": state_name == "open",
+            "signals_active": self._health.signals_active,
+            "schedule_state": state_name,
         }
         self._engine.process_row(row)
+        self._persist_state()
 
     def _state_for(self, symbol: str) -> _SymbolState:
         state = self._states.get(symbol)
@@ -308,12 +435,15 @@ class LiveSignalRunner:
         self._global_freeze = True
         self._events_log.write(
             {
-                "ts": datetime.utcnow().isoformat(),
+                "timestamp_et": datetime.now(tz=ET).isoformat(),
                 "event": "risk_event",
-                "code": code,
+                "reason_code": code,
                 "symbol": "*",
+                "strategy": "runtime",
+                "score": None,
             }
         )
+        self._record_feed_issue(datetime.now(tz=ET))
 
     def _build_client(
         self,
@@ -351,6 +481,225 @@ class LiveSignalRunner:
                 on_overload=self._on_overload,
             )
         raise ValueError("live feed client configuration is required")
+
+    async def _supervise(self) -> None:
+        while not self._stop_event.is_set():
+            now_et = datetime.now(tz=ET)
+            self._log_schedule_transition(now_et)
+            await self._check_stale(now_et)
+            self._maybe_send_heartbeat(now_et)
+            self._maybe_send_eod(now_et)
+            self._persist_state()
+            await asyncio.sleep(5.0)
+
+    async def _check_stale(self, now_et: datetime) -> None:
+        symbols = set(self._health.last_bar_by_symbol())
+        events = self._stale_monitor.check(
+            now_et=now_et,
+            market_open=self._health.snapshot(now_et=now_et, active_ideas=self._engine.active_count()).market_open,
+            symbols=symbols,
+            quote_stream_enabled=bool(getattr(self._client, "quote_schema_enabled", False)),
+        )
+        for event in events:
+            self._handle_stale_event(event, now_et=now_et)
+
+    def _handle_stale_event(self, event: StaleDataEvent, *, now_et: datetime) -> None:
+        last_seen = event.last_timestamp.isoformat() if event.last_timestamp is not None else "none"
+        if event.kind == "recovered":
+            message = (
+                f"<b>RECOVERED</b>\n<b>Symbol:</b> {event.symbol}\n<b>Stream:</b> {event.stream}\n"
+                f"<b>Timestamp:</b> {now_et.isoformat()}\n<b>Last Seen:</b> {last_seen}"
+            )
+            delivery = self._notifier.send_text(text=message)
+            self._write_telegram_event(delivery, timestamp_et=now_et, symbol=event.symbol, strategy="runtime", reason_code="RECOVERED")
+            self._error_forwarder.clear(f"persistent-stale:{event.stream}:{event.symbol}")
+        elif event.kind == "stale":
+            logger.warning("Stale %s data detected for %s lag=%.1fs last=%s", event.stream, event.symbol, event.lag_seconds, last_seen)
+            self._events_log.write(
+                {
+                    "event": "REJECTION_REASON",
+                    "timestamp_et": now_et.isoformat(),
+                    "symbol": event.symbol,
+                    "strategy": "runtime",
+                    "reason_code": f"STALE_{event.stream.upper()}_DATA",
+                    "score": None,
+                }
+            )
+            delivery = self._notifier.send_text(
+                text=(
+                    f"<b>STALE DATA</b>\n<b>Symbol:</b> {event.symbol}\n<b>Stream:</b> {event.stream}\n"
+                    f"<b>Lag Seconds:</b> {event.lag_seconds:.1f}\n<b>Last Seen:</b> {last_seen}"
+                )
+            )
+            self._write_telegram_event(
+                delivery,
+                timestamp_et=now_et,
+                symbol=event.symbol,
+                strategy="runtime",
+                reason_code=f"STALE_{event.stream.upper()}_DATA",
+            )
+            self._record_feed_issue(now_et)
+        elif event.kind == "persistent":
+            logger.warning("Persistent stale %s data for %s lag=%.1fs", event.stream, event.symbol, event.lag_seconds)
+            self._write_telegram_event(
+                self._error_forwarder.send(
+                    error_type="PERSISTENT_STALE_DATA",
+                    message=f"{event.symbol} {event.stream} stale for {event.lag_seconds:.1f}s",
+                    timestamp_et=now_et,
+                    component="stale_data_monitor",
+                    dedupe_key=f"persistent-stale:{event.stream}:{event.symbol}",
+                ),
+                timestamp_et=now_et,
+                symbol=event.symbol,
+                strategy="runtime",
+                reason_code="PERSISTENT_STALE_DATA",
+            )
+
+    def _maybe_send_heartbeat(self, now_et: datetime) -> None:
+        status = self._health.snapshot(now_et=now_et, active_ideas=self._engine.active_count())
+        delivery = self._heartbeat.maybe_send(now_et=now_et, status=status, notifier=self._notifier)
+        if delivery is not None:
+            self._write_telegram_event(delivery, timestamp_et=now_et, symbol="*", strategy="runtime", reason_code="HEARTBEAT")
+
+    def _maybe_send_eod(self, now_et: datetime) -> None:
+        delivery = self._eod.maybe_send(now_et=now_et, notifier=self._notifier)
+        if delivery is not None:
+            self._write_telegram_event(delivery, timestamp_et=now_et, symbol="*", strategy="runtime", reason_code="EOD_SUMMARY")
+
+    def _status_message(self) -> str:
+        status = self._health.snapshot(now_et=datetime.now(tz=ET), active_ideas=self._engine.active_count())
+        market = "open" if status.market_open else "closed"
+        feed = "connected" if status.feed_connected else "disconnected"
+        signals = "true" if status.signals_active else "false"
+        last_bar = status.last_bar_timestamp or "none"
+        strategies = ", ".join(status.strategies_enabled) or "none"
+        return "\n".join(
+            [
+                "<b>STATUS</b>",
+                f"<b>signals_active:</b> {signals}",
+                f"<b>market:</b> {market}",
+                f"<b>feed:</b> {feed}",
+                f"<b>last_bar_timestamp:</b> {last_bar}",
+                f"<b>active_ideas:</b> {status.active_ideas}",
+                f"<b>strategies_enabled:</b> {strategies}",
+            ]
+        )
+
+    async def _set_signals_active(self, value: bool) -> None:
+        self._health.set_signals_active(value)
+        self._persist_state()
+
+    def _log_schedule_transition(self, now_et: datetime) -> None:
+        current = schedule_state(now_et)
+        if current == self._last_schedule_state:
+            return
+        self._last_schedule_state = current
+        self._events_log.write(
+            {
+                "event": "SCHEDULE_STATE_TRANSITION",
+                "timestamp_et": now_et.isoformat(),
+                "symbol": "*",
+                "strategy": "runtime",
+                "reason_code": current.upper(),
+                "score": None,
+            }
+        )
+
+    def _on_signal_registered(self, idea) -> None:
+        self._eod.record_signal(ts_et=idea.timestamp.astimezone(ET), strategy=idea.strategy.value, symbol=idea.symbol_display)
+        self._persist_state()
+
+    def _on_alert_emitted(self, idea, _kind, state, delivery: TelegramDelivery) -> None:
+        if state.value in {"THESIS_INVALIDATED", "CLOSE_SIGNAL"}:
+            self._eod.record_closed_signal(ts_et=datetime.now(tz=ET))
+        self._write_telegram_event(
+            delivery,
+            timestamp_et=datetime.now(tz=ET),
+            symbol=idea.symbol_display,
+            strategy=idea.strategy.value,
+            reason_code=state.value,
+        )
+        self._persist_state()
+
+    def _write_telegram_event(
+        self,
+        delivery: TelegramDelivery,
+        *,
+        timestamp_et: datetime,
+        symbol: str,
+        strategy: str,
+        reason_code: str | None,
+    ) -> None:
+        self._events_log.write(
+            {
+                "event": "TELEGRAM_SEND_SUCCESS" if delivery.delivered else "TELEGRAM_SEND_FAILURE",
+                "timestamp_et": timestamp_et.isoformat(),
+                "symbol": symbol,
+                "strategy": strategy,
+                "reason_code": reason_code,
+                "score": None,
+                "delivery_error": delivery.error,
+            }
+        )
+
+    def _check_disconnect_loop(self, *, now_et: datetime) -> None:
+        cutoff = now_et.timestamp() - 300.0
+        recent = [item for item in self._disconnect_events if item.timestamp() >= cutoff]
+        self._disconnect_events = deque(recent, maxlen=10)
+        if len(recent) < 3:
+            return
+        self._write_telegram_event(
+            self._error_forwarder.send(
+                error_type="REPEATED_DATABENTO_DISCONNECT",
+                message=f"{len(recent)} disconnects within 5 minutes",
+                timestamp_et=now_et,
+                component="databento_adapter",
+                dedupe_key="disconnect-loop",
+            ),
+            timestamp_et=now_et,
+            symbol="*",
+            strategy="runtime",
+            reason_code="REPEATED_DATABENTO_DISCONNECT",
+        )
+
+    def _record_feed_issue(self, ts_et: datetime) -> None:
+        self._eod.record_feed_issue(ts_et=ts_et.astimezone(ET))
+
+    def _persist_state(self) -> None:
+        self._state_store.save(
+            {
+                "signals_active": self._health.signals_active,
+                "active_ideas": self._engine.snapshot_records(),
+                "last_heartbeat_timestamp": self._format_datetime(self._heartbeat.last_sent_at),
+                "last_eod_summary_date_sent": self._eod.last_sent_date.isoformat() if self._eod.last_sent_date else None,
+                "last_seen_bar_timestamp_by_symbol": {
+                    key: value.isoformat() for key, value in self._health.last_bar_by_symbol().items()
+                },
+                "stale_alert_active_flags": self._stale_monitor.stale_flags(),
+                "daily_summary": self._eod.snapshot(),
+            }
+        )
+
+    def _load_last_bar_state(self, payload: dict[str, Any]) -> dict[str, datetime]:
+        last_bars: dict[str, datetime] = {}
+        for symbol, raw_ts in dict(payload.get("last_seen_bar_timestamp_by_symbol", {})).items():
+            parsed = self._parse_datetime(raw_ts)
+            if parsed is not None:
+                last_bars[str(symbol)] = parsed
+        return last_bars
+
+    def _parse_datetime(self, value: Any) -> datetime | None:
+        if not value:
+            return None
+        return datetime.fromisoformat(str(value))
+
+    def _parse_date(self, value: Any):
+        if not value:
+            return None
+        return datetime.fromisoformat(f"{value}T00:00:00").date()
+
+    def _format_datetime(self, value: datetime | None) -> str | None:
+        return value.isoformat() if value is not None else None
 
 
 async def run_live_signals(
