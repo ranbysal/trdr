@@ -3,7 +3,7 @@
   "daily_summary": {
     "by_strategy": {},
     "by_symbol": {},
-    "feed_uptime_issues": 7,
+    "feed_uptime_issues": 31,
     "invalidated_or_closed": 0,
     "total_signals": 0,
     "trade_date": "2026-03-21"

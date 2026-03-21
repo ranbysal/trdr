@@ -347,6 +347,8 @@ def _format_startup_error(exc: Exception) -> str:
 
 def _classify_databento_issue(detail: str, *, default: str) -> str:
     text = detail.lower()
+    if _is_subscription_ack(text):
+        return "DATABENTO_SUBSCRIPTION_ACK"
     if any(token in text for token in ("auth", "unauthorized", "forbidden", "api key", "credential", "invalid key")):
         return "DATABENTO_AUTH_FAILURE"
     if any(
@@ -362,7 +364,20 @@ def _classify_databento_issue(detail: str, *, default: str) -> str:
         )
     ):
         return "DATABENTO_SYMBOL_RESOLUTION_FAILURE"
-    if any(token in text for token in ("entitlement", "not entitled", "subscription", "schema", "dataset permission")):
+    if any(token in text for token in ("entitlement", "not entitled", "dataset permission")):
+        return "DATABENTO_ENTITLEMENT_FAILURE"
+    if any(
+        token in text
+        for token in (
+            "subscription rejected",
+            "subscription failed",
+            "subscription failure",
+            "subscription denied",
+            "schema not enabled",
+            "schema unavailable",
+            "schema permission",
+        )
+    ):
         return "DATABENTO_ENTITLEMENT_FAILURE"
     if any(
         token in text
@@ -370,3 +385,9 @@ def _classify_databento_issue(detail: str, *, default: str) -> str:
     ):
         return "DATABENTO_CONNECTION_RESET"
     return default
+
+
+def _is_subscription_ack(text: str) -> bool:
+    return "subscription request" in text and any(
+        token in text for token in ("succeeded", "successful", "success", "accepted", "ok")
+    )

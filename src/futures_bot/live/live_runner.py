@@ -216,6 +216,8 @@ class LiveSignalRunner:
         if code == "DATABENTO_RECONNECTED":
             self._health.set_feed_connected(True)
             self._error_forwarder.clear("disconnect-loop")
+        elif code == "DATABENTO_SUBSCRIPTION_ACK" or code.startswith("DATABENTO_SYSTEM_"):
+            self._health.set_feed_connected(True)
         elif code.startswith("DATABENTO_"):
             self._health.set_feed_connected(False)
             self._record_feed_issue(message.timestamp_et)
