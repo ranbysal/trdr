@@ -1,0 +1,16 @@
+{
+  "active_ideas": [],
+  "daily_summary": {
+    "by_strategy": {},
+    "by_symbol": {},
+    "feed_uptime_issues": 7,
+    "invalidated_or_closed": 0,
+    "total_signals": 0,
+    "trade_date": "2026-03-21"
+  },
+  "last_eod_summary_date_sent": null,
+  "last_heartbeat_timestamp": "2026-03-21T01:18:15.902232-04:00",
+  "last_seen_bar_timestamp_by_symbol": {},
+  "signals_active": true,
+  "stale_alert_active_flags": {}
+}

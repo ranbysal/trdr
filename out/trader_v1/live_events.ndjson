@@ -1,0 +1,10 @@
+{"event": "SCHEDULE_STATE_TRANSITION", "reason_code": "CLOSED", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T01:18:15.902232-04:00"}
+{"delivery_error": null, "event": "TELEGRAM_SEND_SUCCESS", "reason_code": "HEARTBEAT", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T01:18:15.902232-04:00"}
+{"delivery_error": null, "event": "TELEGRAM_SEND_SUCCESS", "reason_code": "DATABENTO_ENTITLEMENT_FAILURE", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T01:18:16.000915-04:00"}
+{"event": "feed_event", "reason_code": "DATABENTO_ENTITLEMENT_FAILURE", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T01:18:16.000915-04:00"}
+{"event": "feed_event", "reason_code": "DATABENTO_SYSTEM_heartbeat", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T01:18:46.012117-04:00"}
+{"event": "feed_event", "reason_code": "DATABENTO_SYSTEM_end_of_interval", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T01:18:00-04:00"}
+{"event": "feed_event", "reason_code": "DATABENTO_SYSTEM_heartbeat", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T01:19:30.018293-04:00"}
+{"event": "feed_event", "reason_code": "DATABENTO_SYSTEM_end_of_interval", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T01:19:00-04:00"}
+{"event": "feed_event", "reason_code": "DATABENTO_SYSTEM_heartbeat", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T01:20:30.003580-04:00"}
+{"event": "feed_event", "reason_code": "DATABENTO_SYSTEM_end_of_interval", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T01:20:00-04:00"}
