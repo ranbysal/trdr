@@ -87,6 +87,7 @@ def run_multistrategy_signal_loop(
     *,
     data_path: str | Path,
     out_dir: str | Path,
+    state_dir: str | Path | None = None,
     instruments_by_symbol: dict[str, InstrumentMeta],
     enabled_strategies: set[StrategyModule],
     notifier: TelegramNotifier | None = None,
@@ -94,6 +95,7 @@ def run_multistrategy_signal_loop(
     rows = _load_rows(data_path)
     engine = MultiStrategySignalEngine(
         out_dir=out_dir,
+        state_dir=state_dir,
         instruments_by_symbol=instruments_by_symbol,
         enabled_strategies=enabled_strategies,
         notifier=notifier,
@@ -111,6 +113,7 @@ class MultiStrategySignalEngine:
         self,
         *,
         out_dir: str | Path,
+        state_dir: str | Path | None = None,
         instruments_by_symbol: dict[str, InstrumentMeta],
         enabled_strategies: set[StrategyModule],
         notifier: TelegramNotifier | None = None,
@@ -119,6 +122,7 @@ class MultiStrategySignalEngine:
     ) -> None:
         self._runner = _MultiStrategySignalRunner(
             out_dir=Path(out_dir),
+            state_dir=Path(state_dir) if state_dir is not None else None,
             instruments_by_symbol=instruments_by_symbol,
             enabled_strategies=enabled_strategies,
             notifier=notifier,
@@ -150,6 +154,7 @@ class _MultiStrategySignalRunner:
         self,
         *,
         out_dir: Path,
+        state_dir: Path | None,
         instruments_by_symbol: dict[str, InstrumentMeta],
         enabled_strategies: set[StrategyModule],
         notifier: TelegramNotifier | None,
@@ -157,7 +162,12 @@ class _MultiStrategySignalRunner:
         signal_register_callback: Callable[[SignalIdea], None] | None,
     ) -> None:
         self._debug_log = NdjsonWriter(out_dir / "signal_engine.ndjson")
-        self._state = AlertStateManager(out_dir=out_dir, notifier=notifier, on_emit=alert_emit_callback)
+        self._state = AlertStateManager(
+            out_dir=out_dir,
+            state_dir=state_dir,
+            notifier=notifier,
+            on_emit=alert_emit_callback,
+        )
         self._instruments = instruments_by_symbol
         self._enabled = enabled_strategies
         self._signal_register_callback = signal_register_callback

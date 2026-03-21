@@ -1,0 +1,8 @@
+bot:
+  name: prop_v2
+  architecture: atr_normalized_smc
+  mode: scaffold
+  dataset: GLBX.MDP3
+  schema: ohlcv-1m
+  stype_in: continuous
+

@@ -1,0 +1,16 @@
+[Unit]
+Description=Trader V1 signal bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trdr
+Environment=BOT_ALERT_TAG=[TRADER-V1]
+ExecStart=/opt/trdr/.venv/bin/trader-v1 signals --config-dir configs/trader_v1 --out out/trader_v1 --state-dir state/trader_v1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+

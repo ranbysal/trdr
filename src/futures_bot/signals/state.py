@@ -19,15 +19,18 @@ class AlertStateManager:
         self,
         *,
         out_dir: str | Path,
+        state_dir: str | Path | None = None,
         notifier: TelegramNotifier | None = None,
         on_emit: Callable[[SignalIdea, AlertKind, SignalLifecycleState, TelegramDelivery], None] | None = None,
     ) -> None:
         out_path = Path(out_dir)
+        snapshot_path = Path(state_dir) if state_dir is not None else out_path
         out_path.mkdir(parents=True, exist_ok=True)
+        snapshot_path.mkdir(parents=True, exist_ok=True)
         self._notifier = notifier or TelegramNotifier()
         self._on_emit = on_emit
         self._event_log = NdjsonWriter(out_path / "signal_events.ndjson")
-        self._snapshot_path = out_path / "active_ideas.json"
+        self._snapshot_path = snapshot_path / "active_ideas.json"
         self._active: dict[str, SignalIdea] = {}
 
     def register(self, idea: SignalIdea) -> None:

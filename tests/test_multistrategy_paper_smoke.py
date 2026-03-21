@@ -161,6 +161,7 @@ def _write_smoke_csv(path: Path) -> None:
 def test_multistrategy_paper_smoke(tmp_path: Path) -> None:
     csv_path = tmp_path / "bars.csv"
     out_dir = tmp_path / "out"
+    state_dir = tmp_path / "state"
     _write_smoke_csv(csv_path)
 
     rc = main(
@@ -172,6 +173,8 @@ def test_multistrategy_paper_smoke(tmp_path: Path) -> None:
             "configs",
             "--out",
             str(out_dir),
+            "--state-dir",
+            str(state_dir),
             "--strategies",
             "A,B,C,D",
         ]
@@ -187,4 +190,4 @@ def test_multistrategy_paper_smoke(tmp_path: Path) -> None:
     assert "strat_a_orb" in strategies
     assert "strat_b_vwap_rev" in strategies
     assert "strat_c_metals_orb" in strategies
-    assert (out_dir / "active_ideas.json").exists()
+    assert (state_dir / "active_ideas.json").exists()

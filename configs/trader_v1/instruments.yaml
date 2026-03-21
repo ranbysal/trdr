@@ -1,0 +1,45 @@
+version: 1
+instruments:
+  - symbol: ES
+    root_symbol: ES
+    family: equities
+    tick_size: 0.25
+    tick_value: 12.50
+    point_value: 50.0
+    commission_rt: 4.80
+    symbol_type: future
+    micro_equivalent: MES
+    contract_units: 1.0
+
+  - symbol: MES
+    root_symbol: ES
+    family: equities
+    tick_size: 0.25
+    tick_value: 1.25
+    point_value: 5.0
+    commission_rt: 1.20
+    symbol_type: future
+    micro_equivalent: MES
+    contract_units: 1.0
+
+  - symbol: GC
+    root_symbol: GC
+    family: metals
+    tick_size: 0.10
+    tick_value: 10.00
+    point_value: 100.0
+    commission_rt: 5.20
+    symbol_type: future
+    micro_equivalent: MGC
+    contract_units: 100.0
+
+  - symbol: MGC
+    root_symbol: GC
+    family: metals
+    tick_size: 0.10
+    tick_value: 1.00
+    point_value: 10.0
+    commission_rt: 1.30
+    symbol_type: future
+    micro_equivalent: MGC
+    contract_units: 10.0

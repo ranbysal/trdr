@@ -15,7 +15,18 @@ def test_cli_help_runs(capsys: pytest.CaptureFixture[str]) -> None:
 
     assert exc_info.value.code == 0
     output = capsys.readouterr().out
-    assert "futures-bot" in output
+    assert "trader-v1" in output
     assert "backtest" in output
     assert "signals" in output
     assert "validate-config" in output
+
+
+def test_trader_v1_cli_help_runs(capsys: pytest.CaptureFixture[str]) -> None:
+    from bot_trader_v1.cli import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--help"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert "trader-v1" in output

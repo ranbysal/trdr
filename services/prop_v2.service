@@ -1,0 +1,16 @@
+[Unit]
+Description=Prop V2 scaffold bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trdr
+Environment=BOT_ALERT_TAG=[PROP-V2]
+ExecStart=/opt/trdr/.venv/bin/prop-v2 bootstrap --config-dir configs/prop_v2 --out out/prop_v2 --state-dir state/prop_v2
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+

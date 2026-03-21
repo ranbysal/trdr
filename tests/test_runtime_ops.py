@@ -25,8 +25,9 @@ class FakeTelegramNotifier(TelegramNotifier):
         self.texts: list[str] = []
 
     def send_text(self, *, text: str) -> TelegramDelivery:
-        self.texts.append(text)
-        return TelegramDelivery(delivered=True, message=text, response_code=200)
+        prepared = self.prepare_text(text=text)
+        self.texts.append(prepared)
+        return TelegramDelivery(delivered=True, message=prepared, response_code=200)
 
 
 def test_cme_schedule_helpers_cover_open_halt_and_next_times() -> None:
@@ -44,6 +45,14 @@ def test_cme_schedule_helpers_cover_open_halt_and_next_times() -> None:
     assert next_open_time(monday_halt) == datetime(2026, 1, 12, 18, 0, tzinfo=ET)
     assert next_halt_time(datetime(2026, 1, 12, 10, 0, tzinfo=ET)) == datetime(2026, 1, 12, 17, 0, tzinfo=ET)
     assert next_halt_time(friday_close) == datetime(2026, 1, 19, 17, 0, tzinfo=ET)
+
+
+def test_telegram_notifier_uses_env_alert_tag(monkeypatch) -> None:
+    monkeypatch.setenv("BOT_ALERT_TAG", "[BOT-2]")
+
+    notifier = TelegramNotifier(token="token", chat_id="12345")
+
+    assert notifier.prepare_text(text="<b>HEARTBEAT</b>").startswith("[BOT-2] ")
 
 
 def test_telegram_listener_handles_start_stop_and_status() -> None:
@@ -68,8 +77,9 @@ def test_telegram_listener_handles_start_stop_and_status() -> None:
     asyncio.run(scenario())
 
     assert states == [False, True]
-    assert notifier.texts[0] == "<b>Signals:</b> paused"
-    assert notifier.texts[1] == "<b>Signals:</b> active"
+    assert notifier.texts[0] == "[TRADER-V1] <b>Signals:</b> paused"
+    assert notifier.texts[1] == "[TRADER-V1] <b>Signals:</b> active"
+    assert notifier.texts[2].startswith("[TRADER-V1] ")
     assert "signals_active" in notifier.texts[2]
     assert len(notifier.texts) == 3
 
@@ -105,6 +115,7 @@ def test_eod_summary_sends_once_per_day() -> None:
 
     assert first is not None and first.delivered is True
     assert second is None
+    assert notifier.texts[0].startswith("[TRADER-V1] ")
     assert "EOD SUMMARY" in notifier.texts[0]
     assert "Total Signals" in notifier.texts[0]
 
@@ -168,6 +179,7 @@ def test_heartbeat_deduplicates_after_restart() -> None:
 
     assert sent is not None and sent.delivered is True
     assert len(notifier.texts) == 1
+    assert notifier.texts[0].startswith("[TRADER-V1] ")
     assert "HEARTBEAT" in notifier.texts[0]
 
 
@@ -184,3 +196,21 @@ def test_fatal_error_forwarding_formatting() -> None:
     assert "RuntimeError" in message
     assert "feed subscription failed" in message
     assert "databento_adapter" in message
+
+
+def test_error_forwarder_sends_tagged_outbound_message() -> None:
+    notifier = FakeTelegramNotifier()
+    ts = datetime(2026, 1, 12, 10, 5, tzinfo=ET)
+
+    delivery = notifier.send_text(
+        text=format_fatal_error_message(
+            error_type="RuntimeError",
+            message="feed subscription failed",
+            timestamp_et=ts,
+            component="databento_adapter",
+        )
+    )
+
+    assert delivery.delivered is True
+    assert notifier.texts[0].startswith("[TRADER-V1] ")
+    assert "FATAL ERROR" in notifier.texts[0]

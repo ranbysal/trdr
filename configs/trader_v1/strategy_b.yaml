@@ -1,0 +1,4 @@
+version: 1
+name: strategy_b
+enabled: false
+parameters: {}

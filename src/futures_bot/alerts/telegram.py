@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -25,11 +26,13 @@ class TelegramNotifier:
         *,
         token: str | None = None,
         chat_id: str | None = None,
+        alert_tag: str | None = None,
         parse_mode: str = "HTML",
         timeout_s: float = 10.0,
     ) -> None:
         self._token = token
         self._chat_id = chat_id
+        self._alert_tag = os.getenv("BOT_ALERT_TAG", "[TRADER-V1]") if alert_tag is None else alert_tag
         self._parse_mode = parse_mode
         self._timeout_s = timeout_s
 
@@ -53,6 +56,7 @@ class TelegramNotifier:
         return self.send_text(text=message)
 
     def send_text(self, *, text: str) -> TelegramDelivery:
+        text = self.prepare_text(text=text)
         if not self.enabled:
             return TelegramDelivery(delivered=False, message=text, error="telegram_not_configured")
 
@@ -73,6 +77,16 @@ class TelegramNotifier:
             )
         except urllib.error.URLError as exc:
             return TelegramDelivery(delivered=False, message=text, error=str(exc))
+
+    def prepare_text(self, *, text: str) -> str:
+        tag = (self._alert_tag or "").strip()
+        if not tag:
+            return text
+        if text == tag or text.startswith(f"{tag} ") or text.startswith(f"{tag}\n"):
+            return text
+        if not text:
+            return tag
+        return f"{tag} {text}"
 
     def fetch_updates(self, *, offset: int | None = None, timeout_s: int = 1) -> list[dict[str, Any]]:
         if not self.enabled:

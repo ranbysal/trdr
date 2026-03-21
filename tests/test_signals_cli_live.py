@@ -8,8 +8,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from futures_bot.cli import _resolve_live_signal_settings
-from futures_bot.cli import main
+from bot_trader_v1.cli import _resolve_live_signal_settings
+from bot_trader_v1.cli import main
 from futures_bot.live.databento_adapter import (
     DEFAULT_DATABENTO_DATASET,
     DEFAULT_DATABENTO_SCHEMA,
@@ -70,15 +70,17 @@ def test_signals_cli_starts_live_signal_runner_without_execution(monkeypatch: py
     monkeypatch.setenv("DATABENTO_SYMBOLS", ",".join(DEFAULT_DATABENTO_SYMBOLS))
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tg-token")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
-    monkeypatch.setattr("futures_bot.cli.run_live_signals", fake_run_live_signals)
+    monkeypatch.setattr("bot_trader_v1.cli.run_live_signals", fake_run_live_signals)
 
     rc = main(
         [
             "signals",
             "--config-dir",
-            "configs",
+            "configs/trader_v1",
             "--out",
             str(tmp_path / "signals_live"),
+            "--state-dir",
+            str(tmp_path / "state"),
         ]
     )
 
@@ -88,8 +90,10 @@ def test_signals_cli_starts_live_signal_runner_without_execution(monkeypatch: py
     assert captured["databento_schema"] == DEFAULT_DATABENTO_SCHEMA
     assert captured["databento_stype_in"] == DEFAULT_DATABENTO_STYPE_IN
     assert captured["databento_symbols"] == DEFAULT_DATABENTO_SYMBOLS
+    assert captured["state_dir"] == str(tmp_path / "state")
     notifier = captured["notifier"]
     assert getattr(notifier, "enabled") is True
+    assert notifier.prepare_text(text="<b>HEARTBEAT</b>").startswith("[TRADER-V1] ")
 
 
 def test_signal_runner_uses_bars_only_continuous_databento_defaults(

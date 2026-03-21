@@ -64,6 +64,7 @@ class LiveSignalRunner:
         self,
         *,
         out_dir: str | Path,
+        state_dir: str | Path | None = None,
         instruments_by_symbol: dict[str, InstrumentMeta],
         enabled_strategies: set[StrategyModule],
         feed_client: Any | None = None,
@@ -77,11 +78,13 @@ class LiveSignalRunner:
         ws_url: str | None = None,
     ) -> None:
         out_path = Path(out_dir)
+        state_path = Path(state_dir) if state_dir is not None else out_path
         out_path.mkdir(parents=True, exist_ok=True)
+        state_path.mkdir(parents=True, exist_ok=True)
         self._out_path = out_path
         self._notifier = notifier or TelegramNotifier()
         self._events_log = NdjsonWriter(out_path / "live_events.ndjson")
-        self._state_store = JsonStateStore(out_path / "runtime_state.json")
+        self._state_store = JsonStateStore(state_path / "runtime_state.json")
         restored_state = self._state_store.load()
         restored_last_bars = self._load_last_bar_state(restored_state)
         self._health = RuntimeHealth(
@@ -112,6 +115,7 @@ class LiveSignalRunner:
         self._listener_task: asyncio.Task[None] | None = None
         self._engine = MultiStrategySignalEngine(
             out_dir=out_path,
+            state_dir=state_path,
             instruments_by_symbol=instruments_by_symbol,
             enabled_strategies=enabled_strategies,
             notifier=self._notifier,
@@ -705,6 +709,7 @@ class LiveSignalRunner:
 async def run_live_signals(
     *,
     out_dir: str | Path,
+    state_dir: str | Path | None = None,
     instruments_by_symbol: dict[str, InstrumentMeta],
     enabled_strategies: set[StrategyModule],
     notifier: TelegramNotifier | None = None,
@@ -720,6 +725,7 @@ async def run_live_signals(
 ) -> None:
     runner = LiveSignalRunner(
         out_dir=out_dir,
+        state_dir=state_dir,
         instruments_by_symbol=instruments_by_symbol,
         enabled_strategies=enabled_strategies,
         feed_client=feed_client,
