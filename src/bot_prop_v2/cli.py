@@ -9,16 +9,21 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from bot_prop_v2.config import PropV2Config, load_prop_v2_config
-from bot_prop_v2.pipeline import build_pipeline
+from bot_prop_v2.pipeline import PropV2Pipeline, build_pipeline
 from shared.alerts.telegram import TelegramNotifier
 
 
 @dataclass(frozen=True, slots=True)
 class PropV2Runtime:
     config: PropV2Config
+    pipeline: PropV2Pipeline
     out_dir: Path
     state_dir: Path
     notifier: TelegramNotifier
+
+    @property
+    def engine(self):
+        return self.pipeline.engine
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -36,7 +41,7 @@ def _build_parser() -> argparse.ArgumentParser:
     bootstrap.add_argument("--telegram-chat-id", default=os.getenv("TELEGRAM_CHAT_ID"), help="Telegram chat id")
     bootstrap.add_argument(
         "--bot-alert-tag",
-        default=os.getenv("BOT_ALERT_TAG", "[PROP-V2]"),
+        default=os.getenv("BOT_ALERT_TAG"),
         help="Telegram prefix tag for Bot 2 alerts",
     )
 
@@ -49,14 +54,15 @@ def build_runtime(args: argparse.Namespace) -> PropV2Runtime:
     state_dir = Path(args.state_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     state_dir.mkdir(parents=True, exist_ok=True)
+    pipeline = build_pipeline(config, out_dir=out_dir)
     notifier = TelegramNotifier(
         token=getattr(args, "telegram_token", None),
         chat_id=getattr(args, "telegram_chat_id", None),
-        alert_tag=getattr(args, "bot_alert_tag", "[PROP-V2]"),
+        alert_tag=getattr(args, "bot_alert_tag", None) or config.alert_tag,
     )
-    build_pipeline(config)
     return PropV2Runtime(
         config=config,
+        pipeline=pipeline,
         out_dir=out_dir,
         state_dir=state_dir,
         notifier=notifier,
@@ -83,4 +89,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
