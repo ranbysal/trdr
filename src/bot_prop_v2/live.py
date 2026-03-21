@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,9 +14,11 @@ from zoneinfo import ZoneInfo
 from bot_prop_v2.config import PropV2Config
 from bot_prop_v2.pipeline.signal_engine import Candle, Direction, Instrument, Signal, SignalEngine
 from shared.alerts.heartbeat import HeartbeatManager
-from shared.alerts.telegram import TelegramNotifier
+from shared.alerts.telegram import TelegramDelivery, TelegramNotifier
+from shared.alerts.telegram_listener import TelegramCommandListener
 from shared.live.databento_adapter import DatabentoLiveClient
 from shared.live.feed_models import FeedMessage
+from shared.runtime.ndjson_writer import NdjsonWriter
 from shared.runtime.schedule import in_daily_halt, market_is_open
 from shared.runtime.stale_data import StaleDataEvent, StaleDataMonitor
 from shared.runtime.state_store import JsonStateStore
@@ -62,11 +65,16 @@ class PropV2LiveRunner:
         self._engine = engine
         self._out_dir = Path(out_dir)
         self._state_dir = Path(state_dir)
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        self._state_dir.mkdir(parents=True, exist_ok=True)
         self._notifier = notifier
         self._symbols = tuple(databento_symbols)
         self._monitored_symbols = {_normalize_stream_symbol(symbol) for symbol in self._symbols}
+        self._events_log_path = self._out_dir / "live_events.ndjson"
+        self._events_log = NdjsonWriter(self._events_log_path)
         self._state_store = JsonStateStore(self._state_dir / "prop_v2_live_state.json")
         restored = self._state_store.load()
+        self._signals_active = bool(restored.get("signals_active", True))
 
         self._heartbeat = HeartbeatManager(
             interval_hours=config.heartbeat_interval_hours,
@@ -82,6 +90,14 @@ class PropV2LiveRunner:
             str(k): str(v) for k, v in dict(restored.get("last_signal_keys", {})).items()
         }
         self._feed_connected = False
+        self._stop_event = asyncio.Event()
+        self._listener = TelegramCommandListener(
+            notifier=self._notifier,
+            status_provider=self._status_message,
+            set_signals_active=self._set_signals_active,
+            poll_interval_s=float(os.getenv("FUTURES_BOT_TELEGRAM_POLL_INTERVAL_S", "2")),
+        )
+        self._listener_task: asyncio.Task[None] | None = None
         self._client = DatabentoLiveClient(
             api_key=databento_api_key,
             dataset=databento_dataset,
@@ -95,12 +111,17 @@ class PropV2LiveRunner:
         maintenance_task: asyncio.Task[None] | None = None
         await self._client.start()
         self._feed_connected = True
+        self._save_state()
         maintenance_task = asyncio.create_task(self._maintenance_loop(), name="prop-v2-live-maintenance")
+        self._listener_task = asyncio.create_task(self._listener.run(self._stop_event), name="prop-v2-telegram-listener")
         try:
             async for message in self._client.messages():
                 await self._handle_message(message)
         finally:
+            self._stop_event.set()
             self._feed_connected = False
+            if self._listener_task is not None:
+                await asyncio.gather(self._listener_task, return_exceptions=True)
             if maintenance_task is not None:
                 maintenance_task.cancel()
                 try:
@@ -109,6 +130,7 @@ class PropV2LiveRunner:
                     pass
             await self._client.stop()
             self._save_state()
+            self._events_log.flush()
 
     async def _maintenance_loop(self) -> None:
         while True:
@@ -120,17 +142,25 @@ class PropV2LiveRunner:
 
     async def _handle_message(self, message: FeedMessage) -> None:
         if message.type == "event":
-            logger.info("Bot 2 live event: symbol=%s payload=%s", message.symbol, message.payload)
+            self._handle_event(message)
             return
         if message.type == "quote_1s":
+            self._feed_connected = True
             for event in self._stale_monitor.mark_quote(message.symbol, message.timestamp_et):
                 self._handle_stale_event(event)
             return
         if message.type != "bar_1m":
             return
 
+        self._feed_connected = True
         for event in self._stale_monitor.mark_bar(message.symbol, message.timestamp_et):
             self._handle_stale_event(event)
+        self._write_event(
+            event="BAR_RECEIVED",
+            timestamp_et=message.timestamp_et,
+            symbol=message.symbol,
+            reason_code=None,
+        )
 
         instrument = _instrument_from_symbol(message.symbol)
         if instrument is None:
@@ -172,8 +202,17 @@ class PropV2LiveRunner:
             return
 
         signal_key = f"{signal.instrument.value}:{signal.signal_type.value}:{signal.direction.name}:{signal.formed_at.isoformat()}"
-        if signal_key != history.last_signal_key:
+        if self._signals_active and signal_key != history.last_signal_key:
             delivery = self._notifier.send_text(text=_format_signal_message(signal))
+            self._write_telegram_event(
+                delivery,
+                timestamp_et=message.timestamp_et,
+                symbol=signal.instrument.value,
+                strategy=signal.signal_type.value,
+                reason_code=signal.direction.name,
+            )
+            history.last_signal_key = signal_key
+            self._last_signal_keys[instrument.value] = signal_key
             logger.info(
                 "Bot 2 signal alert %s delivered=%s instrument=%s type=%s",
                 signal.direction.name,
@@ -181,8 +220,6 @@ class PropV2LiveRunner:
                 signal.instrument.value,
                 signal.signal_type.value,
             )
-            history.last_signal_key = signal_key
-            self._last_signal_keys[instrument.value] = signal_key
 
         # Signal-only mode: do not keep synthetic positions open when no broker exists.
         self._engine.open_trades.pop(instrument, None)
@@ -198,6 +235,23 @@ class PropV2LiveRunner:
         )
         for event in events:
             self._handle_stale_event(event)
+
+    def _handle_event(self, message: FeedMessage) -> None:
+        code = str(message.payload.get("code", "EVENT"))
+        detail = message.payload.get("detail")
+        logger.info("Bot 2 live event: symbol=%s payload=%s", message.symbol, message.payload)
+        if code in {"DATABENTO_RECONNECTED", "DATABENTO_SUBSCRIPTION_ACK"} or code.startswith("DATABENTO_SYSTEM_"):
+            self._feed_connected = True
+        elif code.startswith("DATABENTO_"):
+            self._feed_connected = False
+        self._write_event(
+            event="feed_event",
+            timestamp_et=message.timestamp_et,
+            symbol=message.symbol,
+            reason_code=code,
+            detail=str(detail) if detail is not None else None,
+        )
+        self._save_state()
 
     def _handle_stale_event(self, event: StaleDataEvent) -> None:
         if event.kind == "recovered":
@@ -221,33 +275,113 @@ class PropV2LiveRunner:
                 f"<b>Stream:</b> {event.stream}\n"
                 f"<b>Lag Seconds:</b> {event.lag_seconds:.1f}"
             )
-        self._notifier.send_text(text=message)
+        delivery = self._notifier.send_text(text=message)
+        self._write_telegram_event(
+            delivery,
+            timestamp_et=datetime.now(tz=ET),
+            symbol=event.symbol,
+            strategy="runtime",
+            reason_code=f"STALE_{event.stream.upper()}_{event.kind.upper()}",
+        )
         self._save_state()
 
     def _maybe_send_heartbeat(self, now_et: datetime) -> None:
-        self._heartbeat.maybe_send(
+        delivery = self._heartbeat.maybe_send(
             now_et=now_et,
             status=self._status(now_et),
             notifier=self._notifier,
         )
+        if delivery is not None:
+            self._write_telegram_event(
+                delivery,
+                timestamp_et=now_et,
+                symbol="*",
+                strategy="runtime",
+                reason_code="HEARTBEAT",
+            )
 
     def _status(self, now_et: datetime) -> PropV2RuntimeStatus:
         last_bar = max(self._stale_monitor.last_bar_by_symbol().values(), default=None)
         return PropV2RuntimeStatus(
-            signals_active=True,
+            signals_active=self._signals_active,
             market_open=market_is_open(now_et),
             in_daily_halt=in_daily_halt(now_et),
             feed_connected=self._feed_connected,
             last_bar_timestamp=last_bar.isoformat() if last_bar is not None else None,
             active_ideas=0,
             strategies_enabled=["PROP_V2_SIGNAL_ENGINE"],
-            output_path=str(self._out_dir),
+            output_path=str(self._events_log_path),
+        )
+
+    def _status_message(self) -> str:
+        status = self._status(datetime.now(tz=ET))
+        market = "open" if status.market_open else "closed"
+        feed = "connected" if status.feed_connected else "disconnected"
+        signals = "true" if status.signals_active else "false"
+        last_bar = status.last_bar_timestamp or "none"
+        strategies = ", ".join(status.strategies_enabled) or "none"
+        return "\n".join(
+            [
+                "<b>STATUS</b>",
+                f"<b>signals_active:</b> {signals}",
+                f"<b>market:</b> {market}",
+                f"<b>feed:</b> {feed}",
+                f"<b>last_bar_timestamp:</b> {last_bar}",
+                f"<b>active_ideas:</b> {status.active_ideas}",
+                f"<b>strategies_enabled:</b> {strategies}",
+            ]
+        )
+
+    async def _set_signals_active(self, value: bool) -> None:
+        self._signals_active = value
+        self._save_state()
+
+    def _write_event(
+        self,
+        *,
+        event: str,
+        timestamp_et: datetime,
+        symbol: str,
+        reason_code: str | None,
+        detail: str | None = None,
+    ) -> None:
+        payload = {
+            "event": event,
+            "timestamp_et": timestamp_et.isoformat(),
+            "symbol": symbol,
+            "strategy": "runtime",
+            "reason_code": reason_code,
+            "score": None,
+        }
+        if detail is not None:
+            payload["detail"] = detail
+        self._events_log.write(payload)
+
+    def _write_telegram_event(
+        self,
+        delivery: TelegramDelivery,
+        *,
+        timestamp_et: datetime,
+        symbol: str,
+        strategy: str,
+        reason_code: str | None,
+    ) -> None:
+        self._events_log.write(
+            {
+                "event": "TELEGRAM_SEND_SUCCESS" if delivery.delivered else "TELEGRAM_SEND_FAILURE",
+                "timestamp_et": timestamp_et.isoformat(),
+                "symbol": symbol,
+                "strategy": strategy,
+                "reason_code": reason_code,
+                "score": None,
+                "delivery_error": delivery.error,
+            }
         )
 
     def _save_state(self) -> None:
         self._state_store.save(
             {
-                "signals_active": True,
+                "signals_active": self._signals_active,
                 "last_heartbeat_timestamp": self._format_datetime(self._heartbeat.last_sent_at),
                 "last_bar_by_symbol": {
                     symbol: ts.isoformat()

@@ -1,0 +1,8 @@
+{"detail": "Subscription request 0 for ohlcv-1m data succeeded", "event": "feed_event", "reason_code": "DATABENTO_SUBSCRIPTION_ACK", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T05:48:27.706380-04:00"}
+{"detail": "Heartbeat", "event": "feed_event", "reason_code": "DATABENTO_SYSTEM_heartbeat", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T05:48:57.717260-04:00"}
+{"detail": "End of interval for ohlcv-1m", "event": "feed_event", "reason_code": "DATABENTO_SYSTEM_end_of_interval", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T05:48:00-04:00"}
+{"detail": "Heartbeat", "event": "feed_event", "reason_code": "DATABENTO_SYSTEM_heartbeat", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T05:49:30.018159-04:00"}
+{"detail": "End of interval for ohlcv-1m", "event": "feed_event", "reason_code": "DATABENTO_SYSTEM_end_of_interval", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T05:49:00-04:00"}
+{"detail": "Heartbeat", "event": "feed_event", "reason_code": "DATABENTO_SYSTEM_heartbeat", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T05:50:30.019552-04:00"}
+{"detail": "End of interval for ohlcv-1m", "event": "feed_event", "reason_code": "DATABENTO_SYSTEM_end_of_interval", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T05:50:00-04:00"}
+{"detail": "Heartbeat", "event": "feed_event", "reason_code": "DATABENTO_SYSTEM_heartbeat", "score": null, "strategy": "runtime", "symbol": "*", "timestamp_et": "2026-03-21T05:51:30.005215-04:00"}
