@@ -20,9 +20,12 @@ class PropV2Config:
     dataset: str
     schema: str
     stype_in: str
+    databento_symbols: tuple[str, ...]
     alert_tag: str
     log_dirname: str
     report_dirname: str
+    heartbeat_interval_hours: float
+    bars_stale_after_s: float
     account_size: float
     max_risk_per_trade: float
     max_daily_loss: float
@@ -78,6 +81,15 @@ def load_prop_v2_config(config_dir: str | Path) -> PropV2Config:
     risk = payload.get("risk") or {}
     if not isinstance(risk, dict):
         raise ValueError("bot.yaml: key 'risk' must be a mapping when present")
+    raw_symbols = runtime.get("databento_symbols", bot.get("databento_symbols", ["NQ.v.0", "YM.v.0", "GC.v.0", "SI.v.0"]))
+    if isinstance(raw_symbols, str):
+        databento_symbols = tuple(symbol.strip() for symbol in raw_symbols.split(",") if symbol.strip())
+    elif isinstance(raw_symbols, list):
+        databento_symbols = tuple(str(symbol).strip() for symbol in raw_symbols if str(symbol).strip())
+    else:
+        raise ValueError("bot.yaml: databento_symbols must be a string or list when present")
+    if not databento_symbols:
+        raise ValueError("bot.yaml: databento_symbols must include at least one symbol")
     return PropV2Config(
         name=str(bot.get("name", "prop_v2")),
         architecture=str(bot.get("architecture", "atr_normalized_smc")),
@@ -85,9 +97,12 @@ def load_prop_v2_config(config_dir: str | Path) -> PropV2Config:
         dataset=str(bot.get("dataset", "GLBX.MDP3")),
         schema=str(bot.get("schema", "ohlcv-1m")),
         stype_in=str(bot.get("stype_in", "continuous")),
+        databento_symbols=databento_symbols,
         alert_tag=str(bot.get("alert_tag", "[PROP-V2]")),
         log_dirname=str(runtime.get("log_dirname", "logs")),
         report_dirname=str(runtime.get("report_dirname", "reports")),
+        heartbeat_interval_hours=float(runtime.get("heartbeat_interval_hours", 4.0)),
+        bars_stale_after_s=float(runtime.get("bars_stale_after_s", 180.0)),
         account_size=float(risk.get("account_size", 150_000.0)),
         max_risk_per_trade=float(risk.get("max_risk_per_trade", 0.01)),
         max_daily_loss=float(risk.get("max_daily_loss", 0.02)),

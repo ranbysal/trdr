@@ -48,3 +48,36 @@ def test_bot_prop_v2_cli_bootstrap_command_returns_zero(tmp_path: Path) -> None:
     )
 
     assert rc == 0
+
+
+def test_bot_prop_v2_cli_signals_initializes_live_runtime(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_run_live_signals(**kwargs) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr("bot_prop_v2.cli.run_live_signals", fake_run_live_signals)
+
+    rc = prop_v2_main(
+        [
+            "signals",
+            "--config-dir",
+            "configs/prop_v2",
+            "--out",
+            str(tmp_path / "out"),
+            "--state-dir",
+            str(tmp_path / "state"),
+            "--databento-api-key",
+            "db-key",
+            "--telegram-token",
+            "tg-token",
+            "--telegram-chat-id",
+            "12345",
+        ]
+    )
+
+    assert rc == 0
+    notifier = captured["notifier"]
+    assert notifier.prepare_text(text="<b>HEARTBEAT</b>").startswith("[PROP-V2] ")
+    assert str(captured["out_dir"]).endswith("/out")
+    assert str(captured["state_dir"]).endswith("/state")
