@@ -7,7 +7,7 @@ name = "futures-bot"
 version = "0.1.0"
 description = "Deterministic futures signal bot scaffold"
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11,<3.14"
 authors = [{ name = "Futures Bot Team" }]
 dependencies = [
   "databento>=0.73.0",
