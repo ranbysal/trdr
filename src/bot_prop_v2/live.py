@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -15,7 +14,6 @@ from bot_prop_v2.config import PropV2Config
 from bot_prop_v2.pipeline.signal_engine import Candle, Direction, Instrument, Signal, SignalEngine
 from shared.alerts.heartbeat import HeartbeatManager
 from shared.alerts.telegram import TelegramDelivery, TelegramNotifier
-from shared.alerts.telegram_listener import TelegramCommandListener
 from shared.live.databento_adapter import DatabentoLiveClient
 from shared.live.feed_models import FeedMessage
 from shared.runtime.ndjson_writer import NdjsonWriter
@@ -91,12 +89,6 @@ class PropV2LiveRunner:
         }
         self._feed_connected = False
         self._stop_event = asyncio.Event()
-        self._listener = TelegramCommandListener(
-            notifier=self._notifier,
-            status_provider=self._status_message,
-            set_signals_active=self._set_signals_active,
-            poll_interval_s=float(os.getenv("FUTURES_BOT_TELEGRAM_POLL_INTERVAL_S", "2")),
-        )
         self._listener_task: asyncio.Task[None] | None = None
         self._client = DatabentoLiveClient(
             api_key=databento_api_key,
@@ -109,19 +101,41 @@ class PropV2LiveRunner:
 
     async def run(self) -> None:
         maintenance_task: asyncio.Task[None] | None = None
-        await self._client.start()
-        self._feed_connected = True
-        self._save_state()
-        maintenance_task = asyncio.create_task(self._maintenance_loop(), name="prop-v2-live-maintenance")
-        self._listener_task = asyncio.create_task(self._listener.run(self._stop_event), name="prop-v2-telegram-listener")
+        startup_complete = False
         try:
+            logger.info(
+                "Bot 2 Telegram command polling disabled; Telegram control is centralized in Trader V1"
+            )
+            await self._client.start()
+            self._feed_connected = True
+            self._save_state()
+            started_at = datetime.now(tz=ET)
+            self._write_telegram_event(
+                self._notifier.send_text(text=self._runtime_message(title="STARTUP_OK", now_et=started_at)),
+                timestamp_et=started_at,
+                symbol="*",
+                strategy="runtime",
+                reason_code="STARTUP_OK",
+            )
+            startup_complete = True
+            maintenance_task = asyncio.create_task(self._maintenance_loop(), name="prop-v2-live-maintenance")
             async for message in self._client.messages():
                 await self._handle_message(message)
+        except Exception as exc:
+            failed_at = datetime.now(tz=ET)
+            reason_code = "STARTUP_FAILED" if not startup_complete else "SHUTDOWN_ERROR"
+            self._write_telegram_event(
+                self._notifier.send_text(text=self._runtime_message(title=reason_code, now_et=failed_at, error=exc)),
+                timestamp_et=failed_at,
+                symbol="*",
+                strategy="runtime",
+                reason_code=reason_code,
+            )
+            logger.exception("Prop V2 live runner failed")
+            raise
         finally:
             self._stop_event.set()
             self._feed_connected = False
-            if self._listener_task is not None:
-                await asyncio.gather(self._listener_task, return_exceptions=True)
             if maintenance_task is not None:
                 maintenance_task.cancel()
                 try:
@@ -331,6 +345,20 @@ class PropV2LiveRunner:
                 f"<b>strategies_enabled:</b> {strategies}",
             ]
         )
+
+    def _runtime_message(self, *, title: str, now_et: datetime, error: Exception | None = None) -> str:
+        status = self._status(now_et)
+        lines = [
+            title,
+            f"feed_status: {'connected' if status.feed_connected else 'disconnected'}",
+            f"market: {'open' if status.market_open else 'closed'}",
+            f"output_dir: {self._out_dir}",
+            f"state_dir: {self._state_dir}",
+        ]
+        if error is not None:
+            lines.insert(1, f"error_type: {type(error).__name__}")
+            lines.insert(2, f"error: {str(error) or type(error).__name__}")
+        return "\n".join(lines)
 
     async def _set_signals_active(self, value: bool) -> None:
         self._signals_active = value

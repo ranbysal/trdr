@@ -73,7 +73,8 @@ def test_prop_v2_live_runner_initializes_ndjson_writer(tmp_path: Path) -> None:
     assert runner._events_log_path.parent.exists()
     assert runner._state_store.path == tmp_path / "state" / "prop_v2_live_state.json"
     assert runner._notifier is notifier
-    assert runner._listener is not None
+    assert not hasattr(runner, "_listener")
+    assert runner._listener_task is None
 
 
 def test_prop_v2_live_runner_writes_feed_event_ndjson(tmp_path: Path) -> None:
@@ -92,27 +93,36 @@ def test_prop_v2_live_runner_writes_feed_event_ndjson(tmp_path: Path) -> None:
     lines = (tmp_path / "out" / "live_events.ndjson").read_text(encoding="utf-8").strip().splitlines()
     records = [json.loads(line) for line in lines]
 
-    assert records[0]["event"] == "feed_event"
-    assert records[0]["reason_code"] == "DATABENTO_SYSTEM_0"
-    assert records[0]["detail"] == "heartbeat"
+    assert any(
+        record["event"] == "TELEGRAM_SEND_SUCCESS" and record["reason_code"] == "STARTUP_OK"
+        for record in records
+    )
+    assert any(
+        record["event"] == "feed_event"
+        and record["reason_code"] == "DATABENTO_SYSTEM_0"
+        and record["detail"] == "heartbeat"
+        for record in records
+    )
 
 
-def test_prop_v2_status_reply_is_tagged(tmp_path: Path) -> None:
+def test_prop_v2_live_runner_sends_startup_ok(tmp_path: Path) -> None:
     runner, notifier = _build_runner(tmp_path)
 
-    async def scenario() -> None:
-        await runner._listener._handle_update(
-            {
-                "update_id": 1,
-                "message": {
-                    "chat": {"id": "12345"},
-                    "text": "/status",
-                },
-            }
-        )
+    asyncio.run(runner.run())
 
-    asyncio.run(scenario())
+    assert notifier.texts[0].startswith("[PROP-V2] STARTUP_OK")
+    assert "feed_status: connected" in notifier.texts[0]
+    assert "market: " in notifier.texts[0]
+    assert f"output_dir: {tmp_path / 'out'}" in notifier.texts[0]
+    assert f"state_dir: {tmp_path / 'state'}" in notifier.texts[0]
 
-    assert notifier.texts[0].startswith("[PROP-V2] <b>STATUS</b>")
-    assert "signals_active" in notifier.texts[0]
-    assert "PROP_V2_SIGNAL_ENGINE" in notifier.texts[0]
+
+def test_prop_v2_live_runner_does_not_start_telegram_polling_listener(caplog, tmp_path: Path) -> None:
+    runner, _ = _build_runner(tmp_path)
+
+    with caplog.at_level("INFO"):
+        asyncio.run(runner.run())
+
+    assert "Telegram command polling disabled; Telegram control is centralized in Trader V1" in caplog.text
+    assert not hasattr(runner, "_listener")
+    assert runner._listener_task is None
