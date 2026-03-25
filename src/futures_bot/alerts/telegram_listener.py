@@ -16,11 +16,13 @@ class TelegramCommandListener:
         notifier: TelegramNotifier,
         status_provider: Callable[[], str],
         set_signals_active: Callable[[bool], Awaitable[None] | None],
+        command_handler: Callable[[str], Awaitable[str | None] | str | None] | None = None,
         poll_interval_s: float = 2.0,
     ) -> None:
         self._notifier = notifier
         self._status_provider = status_provider
         self._set_signals_active = set_signals_active
+        self._command_handler = command_handler
         self._poll_interval_s = poll_interval_s
         self._offset: int | None = None
 
@@ -56,9 +58,20 @@ class TelegramCommandListener:
             return
         if command == "/status":
             self._notifier.send_text(text=self._status_provider())
+            return
+        if self._command_handler is not None:
+            response = await _maybe_await_value(self._command_handler(text))
+            if response:
+                self._notifier.send_text(text=response)
 
 
 async def _maybe_await(result: Awaitable[None] | None) -> None:
     if result is None:
         return
     await result
+
+
+async def _maybe_await_value(result: Awaitable[str | None] | str | None) -> str | None:
+    if result is None or isinstance(result, str):
+        return result
+    return await result

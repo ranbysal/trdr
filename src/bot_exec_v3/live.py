@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo
 
 from bot_exec_v3.executor import PaperExecutor
 from bot_exec_v3.models import ExecutionEventType, ExecutionRuntimeEvent, ExecutorConfig, MarketBar, SignalEvent
+from bot_exec_v3.query import PaperTradeQueries
+from bot_exec_v3.summary import PaperDailySummaryManager
 from futures_bot.runtime.health import RuntimeStatus
 from shared.alerts.heartbeat import HeartbeatManager
 from shared.alerts.telegram import TelegramDelivery, TelegramNotifier
@@ -79,6 +81,10 @@ class ExecutorV3LiveRunner:
         self._heartbeat = HeartbeatManager(
             interval_hours=config.heartbeat_interval_hours,
             last_sent_at=self._parse_datetime(restored.get("last_heartbeat_timestamp")),
+        )
+        self._daily_summary = PaperDailySummaryManager(
+            queries=PaperTradeQueries(config.sqlite_path),
+            last_sent_date=self._parse_date(restored.get("last_paper_summary_date_sent")),
         )
         self._stale_monitor = StaleDataMonitor(
             bars_timeout_s=config.bars_stale_after_s,
@@ -152,6 +158,7 @@ class ExecutorV3LiveRunner:
             await self._poll_signal_queue()
             self._check_stale(now_et)
             self._maybe_send_heartbeat(now_et)
+            self._maybe_send_daily_summary(now_et)
             self._save_state()
 
     async def _poll_signal_queue(self) -> None:
@@ -398,6 +405,17 @@ class ExecutorV3LiveRunner:
                 reason_code="HEARTBEAT",
             )
 
+    def _maybe_send_daily_summary(self, now_et: datetime) -> None:
+        delivery = self._daily_summary.maybe_send(now_et=now_et, notifier=self._notifier)
+        if delivery is not None:
+            self._write_telegram_event(
+                delivery,
+                timestamp_et=now_et,
+                symbol="*",
+                strategy="runtime",
+                reason_code="PAPER_DAILY_SUMMARY",
+            )
+
     def _status(self, now_et: datetime) -> RuntimeStatus:
         last_bar = max(self._stale_monitor.last_bar_by_symbol().values(), default=None)
         return RuntimeStatus(
@@ -475,6 +493,7 @@ class ExecutorV3LiveRunner:
                 "signal_queue_offset": self._signal_queue_offset,
                 "consumed_signal_ids": sorted(self._consumed_signal_ids),
                 "last_heartbeat_timestamp": self._format_datetime(self._heartbeat.last_sent_at),
+                "last_paper_summary_date_sent": self._format_date(self._daily_summary.last_sent_date),
                 "last_bar_by_symbol": {
                     symbol: ts.isoformat()
                     for symbol, ts in self._stale_monitor.last_bar_by_symbol().items()
@@ -508,6 +527,19 @@ class ExecutorV3LiveRunner:
 
     @staticmethod
     def _format_datetime(value: datetime | None) -> str | None:
+        return value.isoformat() if value is not None else None
+
+    @staticmethod
+    def _parse_date(value: Any):
+        if not value or not isinstance(value, str):
+            return None
+        try:
+            return datetime.fromisoformat(value).date() if "T" in value else datetime.strptime(value, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _format_date(value) -> str | None:
         return value.isoformat() if value is not None else None
 
 

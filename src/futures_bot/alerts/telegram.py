@@ -84,6 +84,8 @@ class TelegramNotifier:
             return text
         if text == tag or text.startswith(f"{tag} ") or text.startswith(f"{tag}\n"):
             return text
+        if text.startswith("[") and "]" in text.split(maxsplit=1)[0]:
+            return text
         if not text:
             return tag
         return f"{tag} {text}"

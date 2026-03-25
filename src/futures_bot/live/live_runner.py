@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from bot_exec_v3.controller import PaperCommandController
 from futures_bot.alerts.eod_summary import EodSummaryManager
 from futures_bot.alerts.error_forwarder import ErrorForwarder
 from futures_bot.alerts.heartbeat import HeartbeatManager
@@ -113,6 +114,7 @@ class LiveSignalRunner:
         self._stop_event = asyncio.Event()
         self._supervisor_task: asyncio.Task[None] | None = None
         self._listener_task: asyncio.Task[None] | None = None
+        self._paper_controller = PaperCommandController()
         self._engine = MultiStrategySignalEngine(
             out_dir=out_path,
             state_dir=state_path,
@@ -140,6 +142,7 @@ class LiveSignalRunner:
             notifier=self._notifier,
             status_provider=self._status_message,
             set_signals_active=self._set_signals_active,
+            command_handler=self._paper_controller.handle_command,
             poll_interval_s=float(os.getenv("FUTURES_BOT_TELEGRAM_POLL_INTERVAL_S", "2")),
         )
 
