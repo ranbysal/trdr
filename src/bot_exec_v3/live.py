@@ -1,20 +1,19 @@
-"""Live signal runtime for Bot 2 using shared transport/runtime infrastructure."""
+"""Live paper execution runtime for Bot 3."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from bot_exec_v3.models import Direction as ExecDirection
-from bot_exec_v3.models import SignalEvent as ExecutionSignalEvent
-from bot_exec_v3.models import build_signal_id
-from bot_prop_v2.config import PropV2Config
-from bot_prop_v2.pipeline.signal_engine import Candle, Direction, Instrument, Signal, SignalEngine
+from bot_exec_v3.executor import PaperExecutor
+from bot_exec_v3.models import ExecutionEventType, ExecutionRuntimeEvent, ExecutorConfig, MarketBar, SignalEvent
+from futures_bot.runtime.health import RuntimeStatus
 from shared.alerts.heartbeat import HeartbeatManager
 from shared.alerts.telegram import TelegramDelivery, TelegramNotifier
 from shared.live.databento_adapter import DatabentoLiveClient
@@ -29,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
-class PropV2RuntimeStatus:
+class ExecutorV3RuntimeStatus:
     signals_active: bool
     market_open: bool
     in_daily_halt: bool
@@ -40,18 +39,12 @@ class PropV2RuntimeStatus:
     output_path: str
 
 
-@dataclass(slots=True)
-class SymbolHistory:
-    bars_1m: list[Candle] = field(default_factory=list)
-    last_signal_key: str | None = None
-
-
-class PropV2LiveRunner:
+class ExecutorV3LiveRunner:
     def __init__(
         self,
         *,
-        config: PropV2Config,
-        engine: SignalEngine,
+        config: ExecutorConfig,
+        executor: PaperExecutor,
         out_dir: str | Path,
         state_dir: str | Path,
         notifier: TelegramNotifier,
@@ -63,7 +56,7 @@ class PropV2LiveRunner:
         client_factory: Any | None = None,
     ) -> None:
         self._config = config
-        self._engine = engine
+        self._executor = executor
         self._out_dir = Path(out_dir)
         self._state_dir = Path(state_dir)
         self._out_dir.mkdir(parents=True, exist_ok=True)
@@ -73,12 +66,16 @@ class PropV2LiveRunner:
         self._monitored_symbols = {_normalize_stream_symbol(symbol) for symbol in self._symbols}
         self._events_log_path = self._out_dir / "live_events.ndjson"
         self._events_log = NdjsonWriter(self._events_log_path)
-        self._execution_signals_path = self._out_dir / "execution_signals.ndjson"
-        self._execution_signals_log = NdjsonWriter(self._execution_signals_path)
-        self._state_store = JsonStateStore(self._state_dir / "prop_v2_live_state.json")
+        self._state_store = JsonStateStore(self._state_dir / "executor_v3_live_state.json")
         restored = self._state_store.load()
         self._signals_active = bool(restored.get("signals_active", True))
-
+        self._signal_queue_path = Path(self._config.signal_queue_path)
+        self._signal_queue_offset = int(restored.get("signal_queue_offset", 0))
+        self._consumed_signal_ids = {
+            str(signal_id)
+            for signal_id in list(restored.get("consumed_signal_ids", []))
+            if str(signal_id)
+        }
         self._heartbeat = HeartbeatManager(
             interval_hours=config.heartbeat_interval_hours,
             last_sent_at=self._parse_datetime(restored.get("last_heartbeat_timestamp")),
@@ -88,10 +85,6 @@ class PropV2LiveRunner:
             last_bar_by_symbol=self._parse_last_bars(restored.get("last_bar_by_symbol", {})),
             stale_flags={str(k): bool(v) for k, v in dict(restored.get("stale_alert_active_flags", {})).items()},
         )
-        self._history: dict[Instrument, SymbolHistory] = {}
-        self._last_signal_keys: dict[str, str] = {
-            str(k): str(v) for k, v in dict(restored.get("last_signal_keys", {})).items()
-        }
         self._feed_connected = False
         self._stop_event = asyncio.Event()
         self._listener_task: asyncio.Task[None] | None = None
@@ -108,11 +101,10 @@ class PropV2LiveRunner:
         maintenance_task: asyncio.Task[None] | None = None
         startup_complete = False
         try:
-            logger.info(
-                "Bot 2 Telegram command polling disabled; Telegram control is centralized in Trader V1"
-            )
+            logger.info("Bot 3 Telegram command polling disabled; Bot 3 is send-only in this pass")
             await self._client.start()
             self._feed_connected = True
+            await self._poll_signal_queue()
             self._save_state()
             started_at = datetime.now(tz=ET)
             self._write_telegram_event(
@@ -123,9 +115,11 @@ class PropV2LiveRunner:
                 reason_code="STARTUP_OK",
             )
             startup_complete = True
-            maintenance_task = asyncio.create_task(self._maintenance_loop(), name="prop-v2-live-maintenance")
+            maintenance_task = asyncio.create_task(self._maintenance_loop(), name="executor-v3-live-maintenance")
             async for message in self._client.messages():
+                await self._poll_signal_queue()
                 await self._handle_message(message)
+            await self._poll_signal_queue()
         except Exception as exc:
             failed_at = datetime.now(tz=ET)
             reason_code = "STARTUP_FAILED" if not startup_complete else "SHUTDOWN_ERROR"
@@ -136,7 +130,7 @@ class PropV2LiveRunner:
                 strategy="runtime",
                 reason_code=reason_code,
             )
-            logger.exception("Prop V2 live runner failed")
+            logger.exception("Executor V3 live runner failed")
             raise
         finally:
             self._stop_event.set()
@@ -150,15 +144,88 @@ class PropV2LiveRunner:
             await self._client.stop()
             self._save_state()
             self._events_log.flush()
-            self._execution_signals_log.flush()
 
     async def _maintenance_loop(self) -> None:
         while True:
-            await asyncio.sleep(5)
+            await asyncio.sleep(1)
             now_et = datetime.now(tz=ET)
+            await self._poll_signal_queue()
             self._check_stale(now_et)
             self._maybe_send_heartbeat(now_et)
             self._save_state()
+
+    async def _poll_signal_queue(self) -> None:
+        if not self._signal_queue_path.exists():
+            return
+        file_size = self._signal_queue_path.stat().st_size
+        if file_size < self._signal_queue_offset:
+            self._signal_queue_offset = 0
+        with self._signal_queue_path.open("r", encoding="utf-8") as handle:
+            handle.seek(self._signal_queue_offset)
+            while True:
+                line_start = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                if not line.endswith("\n"):
+                    handle.seek(line_start)
+                    break
+                self._signal_queue_offset = handle.tell()
+                payload_text = line.strip()
+                if not payload_text:
+                    continue
+                try:
+                    payload = json.loads(payload_text)
+                except json.JSONDecodeError as exc:
+                    self._write_event(
+                        event="SIGNAL_PARSE_ERROR",
+                        timestamp_et=datetime.now(tz=ET),
+                        symbol="*",
+                        reason_code="INVALID_JSON",
+                        detail=str(exc),
+                    )
+                    continue
+                if not isinstance(payload, dict):
+                    self._write_event(
+                        event="SIGNAL_PARSE_ERROR",
+                        timestamp_et=datetime.now(tz=ET),
+                        symbol="*",
+                        reason_code="INVALID_SIGNAL_RECORD",
+                        detail="queue payload must be a JSON object",
+                    )
+                    continue
+                try:
+                    signal = SignalEvent.from_mapping(payload)
+                except (KeyError, TypeError, ValueError) as exc:
+                    self._write_event(
+                        event="SIGNAL_PARSE_ERROR",
+                        timestamp_et=datetime.now(tz=ET),
+                        symbol=str(payload.get("instrument", "*")),
+                        reason_code="INVALID_SIGNAL_SCHEMA",
+                        detail=str(exc),
+                    )
+                    continue
+                if signal.signal_id in self._consumed_signal_ids:
+                    self._write_event(
+                        event="SIGNAL_SKIPPED_DUPLICATE",
+                        timestamp_et=datetime.now(tz=ET),
+                        symbol=signal.instrument,
+                        reason_code=signal.signal_id,
+                    )
+                    continue
+                received_at = datetime.now(tz=ET)
+                result = self._executor.submit_signal(signal, received_at_et=received_at)
+                self._consumed_signal_ids.add(signal.signal_id)
+                self._emit_execution_events(result.events)
+                if not result.accepted:
+                    self._write_event(
+                        event="SIGNAL_REJECTED",
+                        timestamp_et=received_at,
+                        symbol=signal.instrument,
+                        reason_code=result.reason,
+                        detail=signal.signal_id,
+                    )
+        self._save_state()
 
     async def _handle_message(self, message: FeedMessage) -> None:
         if message.type == "event":
@@ -181,76 +248,81 @@ class PropV2LiveRunner:
             symbol=message.symbol,
             reason_code=None,
         )
-
         instrument = _instrument_from_symbol(message.symbol)
         if instrument is None:
-            logger.debug("Ignoring unsupported Bot 2 symbol: %s", message.symbol)
+            logger.debug("Ignoring unsupported Bot 3 symbol: %s", message.symbol)
             return
-
         payload = message.payload
-        candle = Candle(
-            timestamp=message.timestamp_et.astimezone(ET),
-            open=float(payload["open"]),
-            high=float(payload["high"]),
-            low=float(payload["low"]),
-            close=float(payload["close"]),
-            volume=float(payload["volume"]),
-            instrument=instrument,
-        )
-        history = self._history.setdefault(
-            instrument,
-            SymbolHistory(last_signal_key=self._last_signal_keys.get(instrument.value)),
-        )
-        _upsert_candle(history.bars_1m, candle, max_keep=20_000)
-
-        candles_1m = list(history.bars_1m)
-        candles_5m = _aggregate_candles(candles_1m, timeframe="5m")
-        candles_15m = _aggregate_candles(candles_1m, timeframe="15m")
-        daily_candles = _aggregate_candles(candles_1m, timeframe="1d")
-        weekly_candles = _aggregate_candles(candles_1m, timeframe="1w")
-
-        signal = self._engine.on_candle(
-            candle=candle,
-            candles_1m=candles_1m,
-            candles_5m=candles_5m,
-            candles_15m=candles_15m,
-            daily_candles=daily_candles,
-            weekly_candles=weekly_candles,
-        )
-        if signal is None:
-            self._save_state()
-            return
-
-        signal_key = f"{signal.instrument.value}:{signal.signal_type.value}:{signal.direction.name}:{signal.formed_at.isoformat()}"
-        if self._signals_active and signal_key != history.last_signal_key:
-            delivery = self._notifier.send_text(text=_format_signal_message(signal))
-            execution_signal = _build_execution_signal_event(
-                signal=signal,
-                source_bot=self._config.name,
-                freshness_seconds=max(1, int(round(self._config.bars_stale_after_s))),
+        result = self._executor.on_market_bar(
+            MarketBar(
+                instrument=instrument,
+                timestamp_et=message.timestamp_et.astimezone(ET),
+                open=float(payload["open"]),
+                high=float(payload["high"]),
+                low=float(payload["low"]),
+                close=float(payload["close"]),
             )
-            self._execution_signals_log.write(execution_signal.to_record())
-            self._write_telegram_event(
-                delivery,
-                timestamp_et=message.timestamp_et,
-                symbol=signal.instrument.value,
-                strategy=signal.signal_type.value,
-                reason_code=signal.direction.name,
-            )
-            history.last_signal_key = signal_key
-            self._last_signal_keys[instrument.value] = signal_key
-            logger.info(
-                "Bot 2 signal alert %s delivered=%s instrument=%s type=%s",
-                signal.direction.name,
-                delivery.delivered,
-                signal.instrument.value,
-                signal.signal_type.value,
-            )
-
-        # Signal-only mode: do not keep synthetic positions open when no broker exists.
-        self._engine.open_trades.pop(instrument, None)
-        self._engine.risk.open_positions.pop(instrument, None)
+        )
+        self._emit_execution_events(result.events)
         self._save_state()
+
+    def _emit_execution_events(self, events: tuple[ExecutionRuntimeEvent, ...]) -> None:
+        for event in events:
+            self._write_execution_event(event)
+            self._notify_execution_event(event)
+
+    def _notify_execution_event(self, event: ExecutionRuntimeEvent) -> None:
+        if event.event_type not in {
+            ExecutionEventType.SIGNAL_RECEIVED,
+            ExecutionEventType.ORDER_FILLED,
+            ExecutionEventType.TP_HIT,
+            ExecutionEventType.STOP_HIT,
+            ExecutionEventType.POSITION_CLOSED,
+        }:
+            return
+        lines = [
+            event.event_type.value,
+            f"signal_id: {event.signal_id}",
+            f"instrument: {event.instrument}",
+        ]
+        if event.order_id is not None:
+            lines.append(f"order_id: {event.order_id}")
+        if event.position_id is not None:
+            lines.append(f"position_id: {event.position_id}")
+        if event.fill_type is not None:
+            lines.append(f"fill_type: {event.fill_type.value}")
+        if event.price is not None:
+            lines.append(f"price: {event.price:.2f}")
+        if event.quantity is not None:
+            lines.append(f"quantity: {event.quantity}")
+        if event.realized_pnl is not None:
+            lines.append(f"realized_pnl: {event.realized_pnl:.2f}")
+        lines.append(f"detail: {event.message}")
+        delivery = self._notifier.send_text(text="\n".join(lines))
+        self._write_telegram_event(
+            delivery,
+            timestamp_et=event.timestamp_et,
+            symbol=event.instrument,
+            strategy="executor_v3",
+            reason_code=event.event_type.value,
+        )
+
+    def _write_execution_event(self, event: ExecutionRuntimeEvent) -> None:
+        payload = {
+            "event": event.event_type.value,
+            "timestamp_et": event.timestamp_et.isoformat(),
+            "symbol": event.instrument,
+            "strategy": "executor_v3",
+            "reason_code": event.fill_type.value if event.fill_type is not None else event.event_type.value,
+            "signal_id": event.signal_id,
+            "order_id": event.order_id,
+            "position_id": event.position_id,
+            "price": event.price,
+            "quantity": event.quantity,
+            "realized_pnl": event.realized_pnl,
+            "detail": event.message,
+        }
+        self._events_log.write(payload)
 
     def _check_stale(self, now_et: datetime) -> None:
         events = self._stale_monitor.check(
@@ -265,7 +337,7 @@ class PropV2LiveRunner:
     def _handle_event(self, message: FeedMessage) -> None:
         code = str(message.payload.get("code", "EVENT"))
         detail = message.payload.get("detail")
-        logger.info("Bot 2 live event: symbol=%s payload=%s", message.symbol, message.payload)
+        logger.info("Bot 3 live event: symbol=%s payload=%s", message.symbol, message.payload)
         if code in {"DATABENTO_RECONNECTED", "DATABENTO_SUBSCRIPTION_ACK"} or code.startswith("DATABENTO_SYSTEM_"):
             self._feed_connected = True
         elif code.startswith("DATABENTO_"):
@@ -326,36 +398,17 @@ class PropV2LiveRunner:
                 reason_code="HEARTBEAT",
             )
 
-    def _status(self, now_et: datetime) -> PropV2RuntimeStatus:
+    def _status(self, now_et: datetime) -> RuntimeStatus:
         last_bar = max(self._stale_monitor.last_bar_by_symbol().values(), default=None)
-        return PropV2RuntimeStatus(
+        return RuntimeStatus(
             signals_active=self._signals_active,
             market_open=market_is_open(now_et),
             in_daily_halt=in_daily_halt(now_et),
             feed_connected=self._feed_connected,
             last_bar_timestamp=last_bar.isoformat() if last_bar is not None else None,
             active_ideas=0,
-            strategies_enabled=["PROP_V2_SIGNAL_ENGINE"],
+            strategies_enabled=["EXECUTOR_V3_PAPER"],
             output_path=str(self._events_log_path),
-        )
-
-    def _status_message(self) -> str:
-        status = self._status(datetime.now(tz=ET))
-        market = "open" if status.market_open else "closed"
-        feed = "connected" if status.feed_connected else "disconnected"
-        signals = "true" if status.signals_active else "false"
-        last_bar = status.last_bar_timestamp or "none"
-        strategies = ", ".join(status.strategies_enabled) or "none"
-        return "\n".join(
-            [
-                "<b>STATUS</b>",
-                f"<b>signals_active:</b> {signals}",
-                f"<b>market:</b> {market}",
-                f"<b>feed:</b> {feed}",
-                f"<b>last_bar_timestamp:</b> {last_bar}",
-                f"<b>active_ideas:</b> {status.active_ideas}",
-                f"<b>strategies_enabled:</b> {strategies}",
-            ]
         )
 
     def _runtime_message(self, *, title: str, now_et: datetime, error: Exception | None = None) -> str:
@@ -364,6 +417,7 @@ class PropV2LiveRunner:
             title,
             f"feed_status: {'connected' if status.feed_connected else 'disconnected'}",
             f"market: {'open' if status.market_open else 'closed'}",
+            f"signal_queue: {self._signal_queue_path}",
             f"output_dir: {self._out_dir}",
             f"state_dir: {self._state_dir}",
         ]
@@ -371,10 +425,6 @@ class PropV2LiveRunner:
             lines.insert(1, f"error_type: {type(error).__name__}")
             lines.insert(2, f"error: {str(error) or type(error).__name__}")
         return "\n".join(lines)
-
-    async def _set_signals_active(self, value: bool) -> None:
-        self._signals_active = value
-        self._save_state()
 
     def _write_event(
         self,
@@ -422,13 +472,14 @@ class PropV2LiveRunner:
         self._state_store.save(
             {
                 "signals_active": self._signals_active,
+                "signal_queue_offset": self._signal_queue_offset,
+                "consumed_signal_ids": sorted(self._consumed_signal_ids),
                 "last_heartbeat_timestamp": self._format_datetime(self._heartbeat.last_sent_at),
                 "last_bar_by_symbol": {
                     symbol: ts.isoformat()
                     for symbol, ts in self._stale_monitor.last_bar_by_symbol().items()
                 },
                 "stale_alert_active_flags": self._stale_monitor.stale_flags(),
-                "last_signal_keys": self._last_signal_keys,
             }
         )
 
@@ -462,8 +513,8 @@ class PropV2LiveRunner:
 
 async def run_live_signals(
     *,
-    config: PropV2Config,
-    engine: SignalEngine,
+    config: ExecutorConfig,
+    executor: PaperExecutor,
     out_dir: str | Path,
     state_dir: str | Path,
     notifier: TelegramNotifier,
@@ -474,9 +525,9 @@ async def run_live_signals(
     databento_symbols: tuple[str, ...],
     client_factory: Any | None = None,
 ) -> None:
-    runner = PropV2LiveRunner(
+    runner = ExecutorV3LiveRunner(
         config=config,
-        engine=engine,
+        executor=executor,
         out_dir=out_dir,
         state_dir=state_dir,
         notifier=notifier,
@@ -490,139 +541,18 @@ async def run_live_signals(
     await runner.run()
 
 
-def _instrument_from_symbol(symbol: str) -> Instrument | None:
+def _instrument_from_symbol(symbol: str) -> str | None:
     normalized = _normalize_stream_symbol(symbol)
     if normalized.startswith("NQ"):
-        return Instrument.NQ
+        return "NQ"
     if normalized.startswith("YM"):
-        return Instrument.YM
+        return "YM"
     if normalized.startswith(("GC", "MGC", "GOLD")):
-        return Instrument.GOLD
+        return "GC"
     if normalized.startswith(("SI", "SILVER")):
-        return Instrument.SILVER
+        return "SI"
     return None
-
-
-def _upsert_candle(candles: list[Candle], candle: Candle, *, max_keep: int) -> None:
-    if candles and candles[-1].timestamp == candle.timestamp:
-        candles[-1] = candle
-    else:
-        candles.append(candle)
-    if len(candles) > max_keep:
-        del candles[:-max_keep]
-
-
-def _aggregate_candles(candles: list[Candle], *, timeframe: str) -> list[Candle]:
-    if not candles:
-        return []
-    buckets: dict[datetime, Candle] = {}
-    ordered_keys: list[datetime] = []
-    for candle in candles:
-        bucket = _bucket_start(candle.timestamp, timeframe)
-        existing = buckets.get(bucket)
-        if existing is None:
-            buckets[bucket] = Candle(
-                timestamp=bucket,
-                open=candle.open,
-                high=candle.high,
-                low=candle.low,
-                close=candle.close,
-                volume=candle.volume,
-                instrument=candle.instrument,
-            )
-            ordered_keys.append(bucket)
-        else:
-            existing.high = max(existing.high, candle.high)
-            existing.low = min(existing.low, candle.low)
-            existing.close = candle.close
-            existing.volume += candle.volume
-    return [buckets[key] for key in ordered_keys]
-
-
-def _bucket_start(timestamp: datetime, timeframe: str) -> datetime:
-    ts = timestamp.astimezone(ET)
-    if timeframe == "5m":
-        minute = ts.minute - (ts.minute % 5)
-        return ts.replace(minute=minute, second=0, microsecond=0)
-    if timeframe == "15m":
-        minute = ts.minute - (ts.minute % 15)
-        return ts.replace(minute=minute, second=0, microsecond=0)
-    if timeframe == "1d":
-        return ts.replace(hour=0, minute=0, second=0, microsecond=0)
-    if timeframe == "1w":
-        week_start = ts.replace(hour=0, minute=0, second=0, microsecond=0)
-        return week_start - timedelta(days=week_start.weekday())
-    raise ValueError(f"Unsupported timeframe: {timeframe}")
-
-
-def _format_signal_message(signal: Signal) -> str:
-    side = "LONG" if signal.direction == Direction.LONG else "SHORT"
-    return "\n".join(
-        [
-            "<b>BOT 2 SIGNAL</b>",
-            f"<b>Instrument:</b> {signal.instrument.value}",
-            f"<b>Direction:</b> {side}",
-            f"<b>Type:</b> {signal.signal_type_name}",
-            f"<b>Entry:</b> {signal.entry_price:.2f}",
-            f"<b>Stop:</b> {signal.stop_loss:.2f}",
-            f"<b>TP1:</b> {signal.take_profit_1:.2f}",
-            f"<b>TP2:</b> {signal.take_profit_2:.2f}",
-            f"<b>TP3:</b> {signal.take_profit_3:.2f}",
-            f"<b>Session:</b> {signal.session.value}",
-            f"<b>Confluence:</b> {signal.confluence_score}",
-            f"<b>Formed:</b> {signal.formed_at.isoformat()}",
-            f"<b>Notes:</b> {signal.notes or 'n/a'}",
-        ]
-    )
 
 
 def _normalize_stream_symbol(symbol: str) -> str:
     return str(symbol).split(".", 1)[0].upper()
-
-
-def _build_execution_signal_event(
-    *,
-    signal: Signal,
-    source_bot: str,
-    freshness_seconds: int,
-) -> ExecutionSignalEvent:
-    instrument = _execution_instrument(signal.instrument)
-    direction = ExecDirection.LONG if signal.direction == Direction.LONG else ExecDirection.SHORT
-    signal_id = build_signal_id(
-        source_bot=source_bot,
-        instrument=instrument,
-        direction=direction.value,
-        setup_type=signal.signal_type.value,
-        session=signal.session.value,
-        formed_timestamp_et=signal.formed_at,
-        entry=signal.entry_price,
-        stop=signal.stop_loss,
-        tp1=signal.take_profit_1,
-        tp2=signal.take_profit_2,
-        tp3=signal.take_profit_3,
-    )
-    return ExecutionSignalEvent(
-        signal_id=signal_id,
-        source_bot=source_bot,
-        instrument=instrument,
-        direction=direction,
-        setup_type=signal.signal_type.value,
-        session=signal.session.value,
-        confluence=float(signal.confluence_score),
-        formed_timestamp_et=signal.formed_at,
-        entry=signal.entry_price,
-        stop=signal.stop_loss,
-        tp1=signal.take_profit_1,
-        tp2=signal.take_profit_2,
-        tp3=signal.take_profit_3,
-        notes=signal.notes,
-        freshness_seconds=freshness_seconds,
-    )
-
-
-def _execution_instrument(instrument: Instrument) -> str:
-    if instrument == Instrument.GOLD:
-        return "GC"
-    if instrument == Instrument.SILVER:
-        return "SI"
-    return instrument.value

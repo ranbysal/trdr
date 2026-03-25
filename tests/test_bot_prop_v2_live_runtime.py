@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from bot_prop_v2.config import load_prop_v2_config
 from bot_prop_v2.live import PropV2LiveRunner
 from bot_prop_v2.pipeline import build_pipeline
+from bot_prop_v2.pipeline.signal_engine import Direction, Instrument, SessionWindow, Signal, SignalType
 from futures_bot.alerts.telegram import TelegramDelivery, TelegramNotifier
 from futures_bot.live.feed_models import FeedMessage
 
@@ -126,3 +127,42 @@ def test_prop_v2_live_runner_does_not_start_telegram_polling_listener(caplog, tm
     assert "Telegram command polling disabled; Telegram control is centralized in Trader V1" in caplog.text
     assert not hasattr(runner, "_listener")
     assert runner._listener_task is None
+
+
+def test_prop_v2_live_runner_writes_execution_signal_queue(tmp_path: Path) -> None:
+    runner, _ = _build_runner(tmp_path)
+    runner._client._messages = [
+        FeedMessage(
+            type="bar_1m",
+            timestamp_et=datetime(2026, 1, 12, 9, 30, tzinfo=ET),
+            symbol="NQ",
+            payload={"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1000.0},
+        )
+    ]
+    runner._engine.on_candle = lambda **_: Signal(
+        instrument=Instrument.NQ,
+        direction=Direction.LONG,
+        signal_type=SignalType.ICT_SMC,
+        entry_price=100.5,
+        stop_loss=98.0,
+        take_profit_1=103.0,
+        take_profit_2=105.5,
+        take_profit_3=108.0,
+        risk_amount_usd=250.0,
+        position_size=1.0,
+        confluence_score=4,
+        signal_type_name=SignalType.ICT_SMC.value,
+        session=SessionWindow.NY_OPEN,
+        formed_at=datetime(2026, 1, 12, 9, 30, tzinfo=ET),
+        notes="execution queue test",
+    )
+
+    asyncio.run(runner.run())
+
+    lines = (tmp_path / "out" / "execution_signals.ndjson").read_text(encoding="utf-8").strip().splitlines()
+    record = json.loads(lines[0])
+
+    assert record["source_bot"] == "prop_v2"
+    assert record["instrument"] == "NQ"
+    assert record["direction"] == "LONG"
+    assert record["signal_id"].startswith("prop_v2-")

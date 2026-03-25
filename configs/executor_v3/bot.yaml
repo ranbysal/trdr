@@ -1,10 +1,23 @@
 bot:
   enabled: true
   source_bot: prop_v2
-  signal_queue_path: out/prop_v2/signal_queue.ndjson
+  alert_tag: "[EXEC-V3]"
+  dataset: GLBX.MDP3
+  schema: ohlcv-1m
+  stype_in: continuous
+  signal_queue_path: out/prop_v2/execution_signals.ndjson
   sqlite_path: state/executor_v3/paper_ledger.db
   freshness_seconds: 180
   paper_mode: true
+
+runtime:
+  databento_symbols:
+    - NQ.v.0
+    - YM.v.0
+    - GC.v.0
+    - SI.v.0
+  heartbeat_interval_hours: 4.0
+  bars_stale_after_s: 180.0
 
 sizing:
   default_contracts: 1

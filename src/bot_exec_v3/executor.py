@@ -7,6 +7,8 @@ from datetime import datetime
 from bot_exec_v3.journal import PaperTradeJournal
 from bot_exec_v3.models import (
     Direction,
+    ExecutionEventType,
+    ExecutionRuntimeEvent,
     ExecutorConfig,
     FillType,
     MarketBar,
@@ -39,6 +41,15 @@ class PaperExecutor:
                 reason="duplicate signal_id",
                 order_id=None,
                 position_size=None,
+                events=(
+                    ExecutionRuntimeEvent(
+                        event_type=ExecutionEventType.SIGNAL_REJECTED,
+                        signal_id=signal.signal_id,
+                        instrument=signal.instrument,
+                        timestamp_et=received_at_et,
+                        message="duplicate signal_id",
+                    ),
+                ),
             )
         if signal.source_bot != self._config.source_bot:
             self._journal.record_signal(
@@ -47,7 +58,22 @@ class PaperExecutor:
                 status=SignalStatus.REJECTED,
                 rejection_reason="unexpected source_bot",
             )
-            return SubmitSignalResult(False, signal.signal_id, "unexpected source_bot", None, None)
+            return SubmitSignalResult(
+                False,
+                signal.signal_id,
+                "unexpected source_bot",
+                None,
+                None,
+                (
+                    ExecutionRuntimeEvent(
+                        event_type=ExecutionEventType.SIGNAL_REJECTED,
+                        signal_id=signal.signal_id,
+                        instrument=signal.instrument,
+                        timestamp_et=received_at_et,
+                        message="unexpected source_bot",
+                    ),
+                ),
+            )
         freshness_limit = signal.freshness_seconds if signal.freshness_seconds > 0 else self._config.freshness_seconds
         signal_age_seconds = (received_at_et - signal.formed_timestamp_et).total_seconds()
         if signal_age_seconds > freshness_limit:
@@ -57,7 +83,22 @@ class PaperExecutor:
                 status=SignalStatus.REJECTED,
                 rejection_reason="stale signal",
             )
-            return SubmitSignalResult(False, signal.signal_id, "stale signal", None, None)
+            return SubmitSignalResult(
+                False,
+                signal.signal_id,
+                "stale signal",
+                None,
+                None,
+                (
+                    ExecutionRuntimeEvent(
+                        event_type=ExecutionEventType.SIGNAL_REJECTED,
+                        signal_id=signal.signal_id,
+                        instrument=signal.instrument,
+                        timestamp_et=received_at_et,
+                        message="stale signal",
+                    ),
+                ),
+            )
         validation_error = self._validate_signal(signal)
         if validation_error is not None:
             self._journal.record_signal(
@@ -66,7 +107,22 @@ class PaperExecutor:
                 status=SignalStatus.REJECTED,
                 rejection_reason=validation_error,
             )
-            return SubmitSignalResult(False, signal.signal_id, validation_error, None, None)
+            return SubmitSignalResult(
+                False,
+                signal.signal_id,
+                validation_error,
+                None,
+                None,
+                (
+                    ExecutionRuntimeEvent(
+                        event_type=ExecutionEventType.SIGNAL_REJECTED,
+                        signal_id=signal.signal_id,
+                        instrument=signal.instrument,
+                        timestamp_et=received_at_et,
+                        message=validation_error,
+                    ),
+                ),
+            )
 
         plan = self._risk_sizer.size_signal(signal)
         order_id = f"ord_{signal.signal_id}"
@@ -100,19 +156,39 @@ class PaperExecutor:
             as_of_timestamp_et=received_at_et,
             note="signal received and pending bracket order created",
         )
-        return SubmitSignalResult(True, signal.signal_id, None, order_id, plan.quantity)
-
-    def on_market_bar(self, bar: MarketBar) -> MarketUpdateResult:
-        filled_order_ids = list(self._fill_pending_orders(bar))
-        updated_positions, closed_positions = self._update_open_positions(bar)
-        return MarketUpdateResult(
-            filled_order_ids=tuple(filled_order_ids),
-            updated_position_ids=tuple(updated_positions),
-            closed_position_ids=tuple(closed_positions),
+        return SubmitSignalResult(
+            True,
+            signal.signal_id,
+            None,
+            order_id,
+            plan.quantity,
+            (
+                ExecutionRuntimeEvent(
+                    event_type=ExecutionEventType.SIGNAL_RECEIVED,
+                    signal_id=signal.signal_id,
+                    instrument=signal.instrument,
+                    timestamp_et=received_at_et,
+                    message="signal received and pending paper order created",
+                    order_id=order_id,
+                    quantity=plan.quantity,
+                    price=signal.entry,
+                ),
+            ),
         )
 
-    def _fill_pending_orders(self, bar: MarketBar) -> tuple[str, ...]:
+    def on_market_bar(self, bar: MarketBar) -> MarketUpdateResult:
+        filled_order_ids, order_events = self._fill_pending_orders(bar)
+        updated_positions, closed_positions, position_events = self._update_open_positions(bar)
+        return MarketUpdateResult(
+            filled_order_ids=filled_order_ids,
+            updated_position_ids=updated_positions,
+            closed_position_ids=closed_positions,
+            events=order_events + position_events,
+        )
+
+    def _fill_pending_orders(self, bar: MarketBar) -> tuple[tuple[str, ...], tuple[ExecutionRuntimeEvent, ...]]:
         filled_order_ids: list[str] = []
+        events: list[ExecutionRuntimeEvent] = []
         for order in self._journal.get_pending_orders(bar.instrument):
             if not self._bar_reaches_price(bar=bar, price=order.entry_price):
                 continue
@@ -146,11 +222,29 @@ class PaperExecutor:
                 note="position opened",
             )
             filled_order_ids.append(order.order_id)
-        return tuple(filled_order_ids)
+            events.append(
+                ExecutionRuntimeEvent(
+                    event_type=ExecutionEventType.ORDER_FILLED,
+                    signal_id=order.signal_id,
+                    instrument=order.instrument,
+                    timestamp_et=bar.timestamp_et,
+                    message="pending paper order filled",
+                    order_id=order.order_id,
+                    position_id=position_id,
+                    fill_type=FillType.ENTRY,
+                    price=order.entry_price,
+                    quantity=order.quantity,
+                    realized_pnl=0.0,
+                )
+            )
+        return tuple(filled_order_ids), tuple(events)
 
-    def _update_open_positions(self, bar: MarketBar) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    def _update_open_positions(
+        self, bar: MarketBar
+    ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[ExecutionRuntimeEvent, ...]]:
         updated_position_ids: list[str] = []
         closed_position_ids: list[str] = []
+        events: list[ExecutionRuntimeEvent] = []
         for position in self._journal.get_open_positions(bar.instrument):
             if self._stop_triggered(position=position, bar=bar):
                 realized = self._realized_pnl(position=position, exit_price=position.stop_price, quantity=position.quantity_open)
@@ -173,38 +267,84 @@ class PaperExecutor:
                     fill_timestamp_et=bar.timestamp_et,
                     notes="stop hit",
                 )
+                events.append(
+                    ExecutionRuntimeEvent(
+                        event_type=ExecutionEventType.STOP_HIT,
+                        signal_id=position.signal_id,
+                        instrument=position.instrument,
+                        timestamp_et=bar.timestamp_et,
+                        message="stop hit",
+                        order_id=position.order_id,
+                        position_id=position.position_id,
+                        fill_type=FillType.STOP,
+                        price=position.stop_price,
+                        quantity=position.quantity_open,
+                        realized_pnl=realized,
+                    )
+                )
                 self._close_position(position=position, closed_at_et=bar.timestamp_et, note="stop hit")
                 updated_position_ids.append(position.position_id)
                 closed_position_ids.append(position.position_id)
+                events.append(self._position_closed_event(position=position, closed_at_et=bar.timestamp_et))
                 continue
 
             if self._target_triggered(position.direction, position.tp1_price, bar) and position.tp1_filled_quantity < position.tp1_quantity:
                 updated_position_ids.append(position.position_id)
                 position_id = position.position_id
-                self._take_profit(position=position, fill_type=FillType.TP1, quantity=position.tp1_quantity, price=position.tp1_price, filled_at_et=bar.timestamp_et, note="tp1 hit")
+                events.append(
+                    self._take_profit(
+                        position=position,
+                        fill_type=FillType.TP1,
+                        quantity=position.tp1_quantity,
+                        price=position.tp1_price,
+                        filled_at_et=bar.timestamp_et,
+                        note="tp1 hit",
+                    )
+                )
                 position = self._refresh_open_position(position_id)
                 if position is None:
                     closed_position_ids.append(position_id)
+                    events.append(self._position_closed_event_from_ids(position_id=position_id, signal_id=position_id.removeprefix("pos_"), instrument=bar.instrument, closed_at_et=bar.timestamp_et))
                     continue
 
             if position.tp2_quantity > 0 and self._target_triggered(position.direction, position.tp2_price, bar) and position.tp2_filled_quantity < position.tp2_quantity:
                 updated_position_ids.append(position.position_id)
                 position_id = position.position_id
-                self._take_profit(position=position, fill_type=FillType.TP2, quantity=position.tp2_quantity, price=position.tp2_price, filled_at_et=bar.timestamp_et, note="tp2 hit")
+                events.append(
+                    self._take_profit(
+                        position=position,
+                        fill_type=FillType.TP2,
+                        quantity=position.tp2_quantity,
+                        price=position.tp2_price,
+                        filled_at_et=bar.timestamp_et,
+                        note="tp2 hit",
+                    )
+                )
                 position = self._refresh_open_position(position_id)
                 if position is None:
                     closed_position_ids.append(position_id)
+                    events.append(self._position_closed_event_from_ids(position_id=position_id, signal_id=position_id.removeprefix("pos_"), instrument=bar.instrument, closed_at_et=bar.timestamp_et))
                     continue
 
             if position.tp3_quantity > 0 and self._target_triggered(position.direction, position.tp3_price, bar) and position.tp3_filled_quantity < position.tp3_quantity:
                 updated_position_ids.append(position.position_id)
-                self._take_profit(position=position, fill_type=FillType.TP3, quantity=position.tp3_quantity, price=position.tp3_price, filled_at_et=bar.timestamp_et, note="tp3 hit")
+                events.append(
+                    self._take_profit(
+                        position=position,
+                        fill_type=FillType.TP3,
+                        quantity=position.tp3_quantity,
+                        price=position.tp3_price,
+                        filled_at_et=bar.timestamp_et,
+                        note="tp3 hit",
+                    )
+                )
                 refreshed = self._refresh_open_position(position.position_id)
                 if refreshed is None:
                     closed_position_ids.append(position.position_id)
+                    events.append(self._position_closed_event(position=position, closed_at_et=bar.timestamp_et))
                 else:
                     position = refreshed
-        return tuple(updated_position_ids), tuple(closed_position_ids)
+        return tuple(updated_position_ids), tuple(closed_position_ids), tuple(events)
 
     def _take_profit(
         self,
@@ -215,9 +355,21 @@ class PaperExecutor:
         price: float,
         filled_at_et: datetime,
         note: str,
-    ) -> None:
+    ) -> ExecutionRuntimeEvent:
         if quantity <= 0:
-            return
+            return ExecutionRuntimeEvent(
+                event_type=ExecutionEventType.TP_HIT,
+                signal_id=position.signal_id,
+                instrument=position.instrument,
+                timestamp_et=filled_at_et,
+                message=note,
+                order_id=position.order_id,
+                position_id=position.position_id,
+                fill_type=fill_type,
+                price=price,
+                quantity=0,
+                realized_pnl=0.0,
+            )
         realized = self._realized_pnl(position=position, exit_price=price, quantity=quantity)
         self._journal.apply_position_fill(
             position_id=position.position_id,
@@ -239,20 +391,32 @@ class PaperExecutor:
             notes=note,
         )
         refreshed = self._refresh_open_position(position.position_id)
-        if refreshed is None:
-            return
-        self._journal.record_pnl_snapshot(
-            snapshot_id=f"pnl_{position.signal_id}_{fill_type.value}",
+        if refreshed is not None:
+            self._journal.record_pnl_snapshot(
+                snapshot_id=f"pnl_{position.signal_id}_{fill_type.value}",
+                signal_id=position.signal_id,
+                position_id=position.position_id,
+                status=refreshed.status.value,
+                realized_pnl=refreshed.realized_pnl,
+                unrealized_pnl=0.0,
+                as_of_timestamp_et=filled_at_et,
+                note=note,
+            )
+            if refreshed.quantity_open <= 0:
+                self._close_position(position=refreshed, closed_at_et=filled_at_et, note=note)
+        return ExecutionRuntimeEvent(
+            event_type=ExecutionEventType.TP_HIT,
             signal_id=position.signal_id,
+            instrument=position.instrument,
+            timestamp_et=filled_at_et,
+            message=note,
+            order_id=position.order_id,
             position_id=position.position_id,
-            status=refreshed.status.value,
-            realized_pnl=refreshed.realized_pnl,
-            unrealized_pnl=0.0,
-            as_of_timestamp_et=filled_at_et,
-            note=note,
+            fill_type=fill_type,
+            price=price,
+            quantity=quantity,
+            realized_pnl=realized,
         )
-        if refreshed.quantity_open <= 0:
-            self._close_position(position=refreshed, closed_at_et=filled_at_et, note=note)
 
     def _close_position(self, *, position: OpenPositionRecord, closed_at_et: datetime, note: str) -> None:
         refreshed = self._refresh_open_position(position.position_id)
@@ -278,6 +442,28 @@ class PaperExecutor:
 
     def _refresh_open_position(self, position_id: str) -> OpenPositionRecord | None:
         return self._journal.get_open_position(position_id)
+
+    def _position_closed_event(
+        self, *, position: OpenPositionRecord, closed_at_et: datetime
+    ) -> ExecutionRuntimeEvent:
+        return self._position_closed_event_from_ids(
+            position_id=position.position_id,
+            signal_id=position.signal_id,
+            instrument=position.instrument,
+            closed_at_et=closed_at_et,
+        )
+
+    def _position_closed_event_from_ids(
+        self, *, position_id: str, signal_id: str, instrument: str, closed_at_et: datetime
+    ) -> ExecutionRuntimeEvent:
+        return ExecutionRuntimeEvent(
+            event_type=ExecutionEventType.POSITION_CLOSED,
+            signal_id=signal_id,
+            instrument=instrument,
+            timestamp_et=closed_at_et,
+            message="position closed",
+            position_id=position_id,
+        )
 
     def _validate_signal(self, signal: SignalEvent) -> str | None:
         if signal.formed_timestamp_et.tzinfo is None:
