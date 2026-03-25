@@ -1,0 +1,22 @@
+bot:
+  enabled: true
+  source_bot: prop_v2
+  signal_queue_path: out/prop_v2/signal_queue.ndjson
+  sqlite_path: state/executor_v3/paper_ledger.db
+  freshness_seconds: 180
+  paper_mode: true
+
+sizing:
+  default_contracts: 1
+  contracts_by_instrument:
+    NQ: 1
+    YM: 1
+    GC: 1
+    SI: 1
+  risk_per_trade_percent:
+  account_size: 150000
+  point_value_by_instrument:
+    NQ: 20.0
+    YM: 5.0
+    GC: 10.0
+    SI: 50.0

@@ -28,6 +28,7 @@ live = [
 futures-bot = "futures_bot.cli:main"
 trader-v1 = "bot_trader_v1.cli:main"
 prop-v2 = "bot_prop_v2.cli:main"
+executor-v3 = "bot_exec_v3.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
