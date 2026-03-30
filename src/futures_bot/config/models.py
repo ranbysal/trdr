@@ -80,8 +80,8 @@ class GoldStrategyConfig:
     confirmation: IntermarketConfirmationConfig = field(default_factory=IntermarketConfirmationConfig)
 
     def __post_init__(self) -> None:
-        if self.symbol != "GC":
-            raise ValueError("GoldStrategyConfig must remain instrument-specific to GC")
+        if self.symbol not in {"GC", "MGC"}:
+            raise ValueError("GoldStrategyConfig must remain instrument-specific to GC or MGC")
         _validate_hard_risk(self.hard_risk_per_trade_dollars, self.daily_halt_loss_dollars)
 
 
