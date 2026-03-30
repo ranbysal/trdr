@@ -19,6 +19,9 @@ class StrategyModule(str, Enum):
     STRAT_B_VWAP_REV = "strat_b_vwap_rev"
     STRAT_C_METALS_ORB = "strat_c_metals_orb"
     STRAT_D_PAIR = "strat_d_pair"
+    STRAT_NQ_SIGNAL = "strat_nq_signal"
+    STRAT_YM_SIGNAL = "strat_ym_signal"
+    STRAT_GOLD_SIGNAL = "strat_gold_signal"
 
 
 class Regime(str, Enum):
