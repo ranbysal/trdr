@@ -20,39 +20,12 @@ def compute_stop_ticks(entry_price: float, stop_price: float, tick_size: float) 
 
 def size_single_leg(request: SingleLegSizingRequest) -> SizingDecision:
     """Compute contract count and cost-adjusted risk for a single symbol."""
-    stop_ticks = compute_stop_ticks(request.entry_price, request.stop_price, request.instrument.tick_size)
-    if stop_ticks <= 0:
-        return SizingDecision(
-            approved=False,
-            reason_code="INVALID_STOP_DISTANCE",
-            routed_symbol=request.instrument.symbol,
-            contracts=0,
-            risk_dollars=float(request.equity * request.risk_pct),
-            stop_ticks=stop_ticks,
-            slippage_est_ticks=0.0,
-            adjusted_risk_per_contract=0.0,
-        )
-
     risk_dollars = float(request.equity * request.risk_pct)
-    atr_ticks = float(request.atr_14_1m_price / request.instrument.tick_size)
-    slip = estimate_slippage_ticks(request.instrument.symbol, atr_ticks)
+    base = _risk_basis(request, risk_dollars=risk_dollars)
+    if base is not None:
+        return base
 
-    risk_per_contract = float(abs(request.entry_price - request.stop_price) * request.instrument.point_value)
-    adjusted = risk_per_contract + (slip.slippage_est_ticks * request.instrument.tick_value) + request.instrument.commission_rt
-
-    if adjusted <= 0.0:
-        return SizingDecision(
-            approved=False,
-            reason_code="INVALID_RISK_PER_CONTRACT",
-            routed_symbol=request.instrument.symbol,
-            contracts=0,
-            risk_dollars=risk_dollars,
-            stop_ticks=stop_ticks,
-            slippage_est_ticks=slip.slippage_est_ticks,
-            adjusted_risk_per_contract=adjusted,
-        )
-
-    contracts = int(math.floor(risk_dollars / adjusted))
+    contracts = int(math.floor(risk_dollars / _adjusted_risk_per_contract(request)))
     if contracts < 1:
         return SizingDecision(
             approved=False,
@@ -60,9 +33,9 @@ def size_single_leg(request: SingleLegSizingRequest) -> SizingDecision:
             routed_symbol=request.instrument.symbol,
             contracts=0,
             risk_dollars=risk_dollars,
-            stop_ticks=stop_ticks,
-            slippage_est_ticks=slip.slippage_est_ticks,
-            adjusted_risk_per_contract=adjusted,
+            stop_ticks=compute_stop_ticks(request.entry_price, request.stop_price, request.instrument.tick_size),
+            slippage_est_ticks=_slippage_ticks(request),
+            adjusted_risk_per_contract=_adjusted_risk_per_contract(request),
         )
 
     return SizingDecision(
@@ -71,8 +44,45 @@ def size_single_leg(request: SingleLegSizingRequest) -> SizingDecision:
         routed_symbol=request.instrument.symbol,
         contracts=contracts,
         risk_dollars=risk_dollars,
-        stop_ticks=stop_ticks,
-        slippage_est_ticks=slip.slippage_est_ticks,
+        stop_ticks=compute_stop_ticks(request.entry_price, request.stop_price, request.instrument.tick_size),
+        slippage_est_ticks=_slippage_ticks(request),
+        adjusted_risk_per_contract=_adjusted_risk_per_contract(request),
+    )
+
+
+def size_single_leg_with_hard_risk_cap(
+    request: SingleLegSizingRequest,
+    *,
+    hard_max_risk_dollars: float,
+) -> SizingDecision:
+    """Size using the lower of equity risk budget and an explicit dollar cap."""
+    risk_dollars = min(float(request.equity * request.risk_pct), float(hard_max_risk_dollars))
+    base = _risk_basis(request, risk_dollars=risk_dollars)
+    if base is not None:
+        return base
+
+    adjusted = _adjusted_risk_per_contract(request)
+    if adjusted > risk_dollars:
+        return SizingDecision(
+            approved=False,
+            reason_code="HARD_RISK_CAP_EXCEEDED",
+            routed_symbol=request.instrument.symbol,
+            contracts=0,
+            risk_dollars=risk_dollars,
+            stop_ticks=compute_stop_ticks(request.entry_price, request.stop_price, request.instrument.tick_size),
+            slippage_est_ticks=_slippage_ticks(request),
+            adjusted_risk_per_contract=adjusted,
+        )
+
+    contracts = int(math.floor(risk_dollars / adjusted))
+    return SizingDecision(
+        approved=contracts >= 1,
+        reason_code="APPROVED" if contracts >= 1 else "HARD_RISK_CAP_EXCEEDED",
+        routed_symbol=request.instrument.symbol,
+        contracts=contracts if contracts >= 1 else 0,
+        risk_dollars=risk_dollars,
+        stop_ticks=compute_stop_ticks(request.entry_price, request.stop_price, request.instrument.tick_size),
+        slippage_est_ticks=_slippage_ticks(request),
         adjusted_risk_per_contract=adjusted,
     )
 
@@ -129,3 +139,43 @@ def size_with_micro_routing(
         slippage_est_ticks=routed_decision.slippage_est_ticks,
         adjusted_risk_per_contract=routed_decision.adjusted_risk_per_contract,
     )
+
+
+def _risk_basis(request: SingleLegSizingRequest, *, risk_dollars: float) -> SizingDecision | None:
+    stop_ticks = compute_stop_ticks(request.entry_price, request.stop_price, request.instrument.tick_size)
+    if stop_ticks <= 0:
+        return SizingDecision(
+            approved=False,
+            reason_code="INVALID_STOP_DISTANCE",
+            routed_symbol=request.instrument.symbol,
+            contracts=0,
+            risk_dollars=risk_dollars,
+            stop_ticks=stop_ticks,
+            slippage_est_ticks=0.0,
+            adjusted_risk_per_contract=0.0,
+        )
+
+    adjusted = _adjusted_risk_per_contract(request)
+    if adjusted <= 0.0:
+        return SizingDecision(
+            approved=False,
+            reason_code="INVALID_RISK_PER_CONTRACT",
+            routed_symbol=request.instrument.symbol,
+            contracts=0,
+            risk_dollars=risk_dollars,
+            stop_ticks=stop_ticks,
+            slippage_est_ticks=_slippage_ticks(request),
+            adjusted_risk_per_contract=adjusted,
+        )
+
+    return None
+
+
+def _slippage_ticks(request: SingleLegSizingRequest) -> float:
+    atr_ticks = float(request.atr_14_1m_price / request.instrument.tick_size)
+    return estimate_slippage_ticks(request.instrument.symbol, atr_ticks).slippage_est_ticks
+
+
+def _adjusted_risk_per_contract(request: SingleLegSizingRequest) -> float:
+    risk_per_contract = float(abs(request.entry_price - request.stop_price) * request.instrument.point_value)
+    return risk_per_contract + (_slippage_ticks(request) * request.instrument.tick_value) + request.instrument.commission_rt

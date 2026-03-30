@@ -58,3 +58,27 @@ class OpenRiskEntry:
 class CooldownState:
     consecutive_losses: int
     cooldown_until: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class OpenPositionMtmSnapshot:
+    ts: datetime
+    symbol: str
+    quantity: int
+    avg_entry_price: float
+    mark_price: float
+    point_value: float
+
+    @property
+    def unrealized_pnl(self) -> float:
+        return float((self.mark_price - self.avg_entry_price) * self.quantity * self.point_value)
+
+
+@dataclass(frozen=True, slots=True)
+class AccountRiskState:
+    session_start_equity: float
+    realized_pnl: float
+    unrealized_pnl: float
+    daily_pnl: float
+    daily_loss_limit: float
+    is_daily_halt: bool
