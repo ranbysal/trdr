@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -12,6 +15,7 @@ from futures_bot.core.enums import Family
 from futures_bot.core.types import InstrumentMeta
 
 ET = ZoneInfo("America/New_York")
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _instrument(symbol: str, *, family: Family, tick_size: float, tick_value: float) -> InstrumentMeta:
@@ -194,6 +198,7 @@ def test_replay_determinism_and_identical_inputs_produce_identical_outputs(tmp_p
     assert json.loads(Path(result_a.paths["summary_path"]).read_text(encoding="utf-8")) == json.loads(
         Path(result_b.paths["summary_path"]).read_text(encoding="utf-8")
     )
+    assert result_a.paths["summary_path"].name == "summary.json"
 
 
 def test_rejection_reason_counts_are_stable(tmp_path: Path) -> None:
@@ -254,3 +259,80 @@ def test_mark_to_market_daily_halt_behavior_remains_correct_in_replay(tmp_path: 
 
     assert any(record.outcome.value == "rejected_due_to_daily_halt" for record in result.records)
     assert result.summary["daily_halt_occurrences"][0]["daily_halt_occurrences"] >= 1
+
+
+def test_corrected_replay_cli_writes_required_reports(tmp_path: Path) -> None:
+    data = tmp_path / "validation.csv"
+    out_dir = tmp_path / "out"
+    _write_validation_csv(data)
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO_ROOT / "src")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "futures_bot.backtest.corrected_replay",
+            "--data",
+            str(data),
+            "--out",
+            str(out_dir),
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    expected_files = {
+        "summary.json",
+        "accepted_signals.csv",
+        "rejected_signals.csv",
+        "rejection_reason_counts.csv",
+        "signal_frequency_by_instrument.csv",
+        "daily_halt_events.csv",
+    }
+    assert expected_files <= {path.name for path in out_dir.iterdir()}
+
+    summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["accepted_signal_count"] >= 1
+    assert summary["risk_skip_count"] >= 1
+    assert summary["daily_halt_event_count"] >= 1
+
+
+def test_corrected_replay_cli_fails_loudly_when_required_columns_are_missing(tmp_path: Path) -> None:
+    data = tmp_path / "missing_columns.csv"
+    out_dir = tmp_path / "out"
+    data.write_text(
+        "\n".join(
+            [
+                "timestamp_et,symbol,open,high,low,volume",
+                "2026-01-05T09:30:00-05:00,NQ,20480,20481,20479,1000",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO_ROOT / "src")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "futures_bot.backtest.corrected_replay",
+            "--data",
+            str(data),
+            "--out",
+            str(out_dir),
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "Replay CSV missing required columns" in completed.stderr

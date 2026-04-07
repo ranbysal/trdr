@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import pandas as pd
 
 from futures_bot.backtest.validation_reports import write_validation_reports
 from futures_bot.config.models import GoldStrategyConfig, NQStrategyConfig, YMStrategyConfig
+from futures_bot.core.enums import Family
 from futures_bot.core.types import InstrumentMeta
 from futures_bot.features import effective_anchor_timestamp
 from futures_bot.pipeline.corrected_orchestrator import (
@@ -69,6 +71,25 @@ def run_corrected_validation_replay(
     gold_config: GoldStrategyConfig,
 ) -> ReplayValidationResult:
     replay_rows = _load_replay_rows(data_path)
+    return _run_corrected_validation_replay_rows(
+        replay_rows=replay_rows,
+        out_dir=out_dir,
+        instruments_by_symbol=instruments_by_symbol,
+        nq_config=nq_config,
+        ym_config=ym_config,
+        gold_config=gold_config,
+    )
+
+
+def _run_corrected_validation_replay_rows(
+    *,
+    replay_rows: pd.DataFrame,
+    out_dir: str | Path,
+    instruments_by_symbol: Mapping[str, InstrumentMeta],
+    nq_config: NQStrategyConfig,
+    ym_config: YMStrategyConfig,
+    gold_config: GoldStrategyConfig,
+) -> ReplayValidationResult:
     orchestrator = CorrectedSignalOrchestrator(
         nq_config=nq_config,
         ym_config=ym_config,
@@ -126,15 +147,22 @@ def run_corrected_validation_replay(
             )
         )
 
+    if not records:
+        raise ValueError("Replay produced no evaluation records for the supplied input.")
+
     events_path = _write_events(out_dir=out_dir, records=records)
+    accepted_signals = build_accepted_signals(records)
+    rejected_signals = build_rejected_signals(records)
     signals_by_instrument = build_signals_by_instrument(records)
-    rejections_by_reason = build_rejections_by_reason(records)
+    rejection_reason_counts = build_rejections_by_reason(records)
+    daily_halt_events = build_daily_halt_events(records)
     daily_halt_occurrences = build_daily_halt_occurrences(records)
     signal_frequency_by_instrument = build_signal_frequency_by_instrument(records, replay_rows)
     summary = build_validation_summary(
         records=records,
         signals_by_instrument=signals_by_instrument,
-        rejections_by_reason=rejections_by_reason,
+        rejection_reason_counts=rejection_reason_counts,
+        daily_halt_events=daily_halt_events,
         daily_halt_occurrences=daily_halt_occurrences,
         signal_frequency_by_instrument=signal_frequency_by_instrument,
     )
@@ -142,10 +170,11 @@ def run_corrected_validation_replay(
     paths.update(
         write_validation_reports(
             out_dir=out_dir,
-            signals_by_instrument=signals_by_instrument,
-            rejections_by_reason=rejections_by_reason,
-            daily_halt_occurrences=daily_halt_occurrences,
+            accepted_signals=accepted_signals,
+            rejected_signals=rejected_signals,
+            rejection_reason_counts=rejection_reason_counts,
             signal_frequency_by_instrument=signal_frequency_by_instrument,
+            daily_halt_events=daily_halt_events,
             summary=summary,
         )
     )
@@ -161,6 +190,62 @@ def build_signals_by_instrument(records: list[ReplayValidationRecord] | tuple[Re
     return out.sort_values("symbol").reset_index(drop=True)
 
 
+def build_accepted_signals(records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...]) -> pd.DataFrame:
+    rows = [
+        {
+            "ts": record.ts.isoformat(),
+            "symbol": record.symbol,
+            "outcome": record.outcome.value,
+            "strategy": record.strategy,
+            "effective_anchor_ts": _isoformat_or_none(record.effective_anchor_ts),
+            "current_session_date": record.current_session_date,
+            "stage_events_json": _stage_events_json(record.stage_events),
+        }
+        for record in records
+        if record.outcome is ReplayOutcome.ACCEPTED_SIGNAL
+    ]
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "ts",
+            "symbol",
+            "outcome",
+            "strategy",
+            "effective_anchor_ts",
+            "current_session_date",
+            "stage_events_json",
+        ],
+    )
+
+
+def build_rejected_signals(records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...]) -> pd.DataFrame:
+    rows = [
+        {
+            "ts": record.ts.isoformat(),
+            "symbol": record.symbol,
+            "outcome": record.outcome.value,
+            "rejection_reason": record.rejection_reason,
+            "effective_anchor_ts": _isoformat_or_none(record.effective_anchor_ts),
+            "current_session_date": record.current_session_date,
+            "stage_events_json": _stage_events_json(record.stage_events),
+        }
+        for record in records
+        if record.outcome is not ReplayOutcome.ACCEPTED_SIGNAL
+    ]
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "ts",
+            "symbol",
+            "outcome",
+            "rejection_reason",
+            "effective_anchor_ts",
+            "current_session_date",
+            "stage_events_json",
+        ],
+    )
+
+
 def build_rejections_by_reason(records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...]) -> pd.DataFrame:
     rejected = [record for record in records if record.rejection_reason is not None]
     if not rejected:
@@ -168,6 +253,30 @@ def build_rejections_by_reason(records: list[ReplayValidationRecord] | tuple[Rep
     frame = pd.DataFrame({"rejection_reason": [record.rejection_reason for record in rejected]})
     out = frame.value_counts().rename("count").reset_index()
     return out.sort_values("rejection_reason").reset_index(drop=True)
+
+
+def build_daily_halt_events(records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...]) -> pd.DataFrame:
+    rows = [
+        {
+            "ts": record.ts.isoformat(),
+            "symbol": record.symbol,
+            "rejection_reason": record.rejection_reason,
+            "effective_anchor_ts": _isoformat_or_none(record.effective_anchor_ts),
+            "current_session_date": record.current_session_date,
+        }
+        for record in records
+        if record.outcome is ReplayOutcome.REJECTED_DAILY_HALT
+    ]
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "ts",
+            "symbol",
+            "rejection_reason",
+            "effective_anchor_ts",
+            "current_session_date",
+        ],
+    )
 
 
 def build_daily_halt_occurrences(records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...]) -> pd.DataFrame:
@@ -188,9 +297,10 @@ def build_signal_frequency_by_instrument(
         .rename("active_days")
         .reset_index()
     )
-    signals = build_signals_by_instrument(records).rename(columns={"accepted_signal_count": "accepted_signals"})
-    merged = active_days.merge(signals, how="left", on="symbol").fillna({"accepted_signals": 0})
-    merged["average_signal_frequency"] = merged["accepted_signals"] / merged["active_days"]
+    signals = build_signals_by_instrument(records)
+    merged = active_days.merge(signals, how="left", on="symbol").fillna({"accepted_signal_count": 0})
+    merged["accepted_signal_count"] = merged["accepted_signal_count"].astype(int)
+    merged["accepted_signals_per_active_day"] = merged["accepted_signal_count"] / merged["active_days"]
     return merged.sort_values("symbol").reset_index(drop=True)
 
 
@@ -198,18 +308,29 @@ def build_validation_summary(
     *,
     records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...],
     signals_by_instrument: pd.DataFrame,
-    rejections_by_reason: pd.DataFrame,
+    rejection_reason_counts: pd.DataFrame,
+    daily_halt_events: pd.DataFrame,
     daily_halt_occurrences: pd.DataFrame,
     signal_frequency_by_instrument: pd.DataFrame,
 ) -> dict[str, Any]:
+    accepted_signal_count = int(sum(record.outcome is ReplayOutcome.ACCEPTED_SIGNAL for record in records))
+    rejected_signal_count = len(records) - accepted_signal_count
+    risk_skip_count = int(sum(record.outcome is ReplayOutcome.REJECTED_RISK for record in records))
+    daily_halt_event_count = int(sum(record.outcome is ReplayOutcome.REJECTED_DAILY_HALT for record in records))
     return {
         "record_count": len(records),
-        "accepted_signal_count": int(sum(record.outcome is ReplayOutcome.ACCEPTED_SIGNAL for record in records)),
+        "accepted_signal_count": accepted_signal_count,
+        "rejected_signal_count": rejected_signal_count,
+        "risk_skip_count": risk_skip_count,
+        "daily_halt_event_count": daily_halt_event_count,
+        "accepted_signals_by_instrument": signals_by_instrument.to_dict(orient="records"),
         "signals_by_instrument": signals_by_instrument.to_dict(orient="records"),
-        "rejections_by_reason": rejections_by_reason.to_dict(orient="records"),
+        "rejection_reason_counts": rejection_reason_counts.to_dict(orient="records"),
+        "rejections_by_reason": rejection_reason_counts.to_dict(orient="records"),
+        "daily_halt_events": daily_halt_events.to_dict(orient="records"),
         "daily_halt_occurrences": daily_halt_occurrences.to_dict(orient="records"),
+        "signal_frequency_by_instrument": signal_frequency_by_instrument.to_dict(orient="records"),
         "average_signal_frequency_by_instrument": signal_frequency_by_instrument.to_dict(orient="records"),
-        "note": "Validation counts only. This report does not prove win rate or profitability.",
     }
 
 
@@ -221,6 +342,8 @@ def _load_replay_rows(data_path: str | Path) -> pd.DataFrame:
     rows = rows.copy()
     rows["symbol"] = rows["symbol"].astype(str).str.strip().str.upper()
     rows["ts"] = pd.to_datetime(rows["timestamp_et"], errors="raise")
+    for column in ("open", "high", "low", "close", "volume"):
+        rows[column] = pd.to_numeric(rows[column], errors="raise")
     rows = rows.sort_values(["ts", "symbol"], kind="mergesort").reset_index(drop=True)
     return rows
 
@@ -328,15 +451,27 @@ def _write_events(*, out_dir: str | Path, records: list[ReplayValidationRecord])
 def _record_to_dict(record: ReplayValidationRecord) -> dict[str, Any]:
     payload = asdict(record)
     payload["outcome"] = record.outcome.value
-    payload["stage_events"] = [
+    payload["stage_events"] = _stage_events_payload(record.stage_events)
+    return payload
+
+
+def _stage_events_payload(stage_events: Sequence[StageEvent]) -> list[dict[str, str]]:
+    return [
         {
             "stage": event.stage.value,
             "status": event.status.value,
             "reason": event.reason,
         }
-        for event in record.stage_events
+        for event in stage_events
     ]
-    return payload
+
+
+def _stage_events_json(stage_events: Sequence[StageEvent]) -> str:
+    return json.dumps(_stage_events_payload(stage_events), sort_keys=True)
+
+
+def _isoformat_or_none(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
 
 
 def _row_bool(row: Any, field: str, *, default: bool) -> bool:
@@ -381,3 +516,116 @@ def _row_optional_str(row: Any, field: str) -> str | None:
     if raw is None or pd.isna(raw):
         return None
     return str(raw).strip()
+
+
+def _default_instrument(symbol: str) -> InstrumentMeta:
+    if symbol == "NQ":
+        return InstrumentMeta(
+            symbol="NQ",
+            root_symbol="NQ",
+            family=Family.EQUITIES,
+            tick_size=0.25,
+            tick_value=5.0,
+            point_value=20.0,
+            commission_rt=4.8,
+            symbol_type="future",
+            micro_equivalent="MNQ",
+            contract_units=1.0,
+        )
+    if symbol == "YM":
+        return InstrumentMeta(
+            symbol="YM",
+            root_symbol="YM",
+            family=Family.EQUITIES,
+            tick_size=1.0,
+            tick_value=5.0,
+            point_value=5.0,
+            commission_rt=4.8,
+            symbol_type="future",
+            micro_equivalent="MYM",
+            contract_units=1.0,
+        )
+    if symbol == "GC":
+        return InstrumentMeta(
+            symbol="GC",
+            root_symbol="GC",
+            family=Family.METALS,
+            tick_size=0.1,
+            tick_value=10.0,
+            point_value=100.0,
+            commission_rt=4.8,
+            symbol_type="future",
+            micro_equivalent="MGC",
+            contract_units=1.0,
+        )
+    if symbol == "MGC":
+        return InstrumentMeta(
+            symbol="MGC",
+            root_symbol="GC",
+            family=Family.METALS,
+            tick_size=0.1,
+            tick_value=1.0,
+            point_value=10.0,
+            commission_rt=4.8,
+            symbol_type="future",
+            micro_equivalent="MGC",
+            contract_units=1.0,
+        )
+    raise ValueError(f"Unsupported corrected replay symbol: {symbol}")
+
+
+def _build_default_runtime(
+    replay_rows: pd.DataFrame,
+) -> tuple[dict[str, InstrumentMeta], NQStrategyConfig, YMStrategyConfig, GoldStrategyConfig]:
+    symbols = {str(symbol).upper() for symbol in replay_rows["symbol"].unique()}
+    if "GC" in symbols and "MGC" in symbols:
+        raise ValueError("Replay input cannot mix GC and MGC in the standalone corrected replay CLI.")
+
+    gold_symbol = "MGC" if "MGC" in symbols else "GC"
+    instruments = {
+        "NQ": _default_instrument("NQ"),
+        "YM": _default_instrument("YM"),
+        gold_symbol: _default_instrument(gold_symbol),
+    }
+    return (
+        instruments,
+        NQStrategyConfig(hard_risk_per_trade_dollars=750.0, daily_halt_loss_dollars=1_500.0),
+        YMStrategyConfig(hard_risk_per_trade_dollars=5.0, daily_halt_loss_dollars=1_500.0),
+        GoldStrategyConfig(
+            hard_risk_per_trade_dollars=400.0,
+            daily_halt_loss_dollars=1_200.0,
+            symbol=gold_symbol,
+        ),
+    )
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run deterministic corrected replay validation over historical 1m OHLCV bars."
+    )
+    parser.add_argument("--data", required=True, help="Path to the historical 1m OHLCV CSV input.")
+    parser.add_argument("--out", required=True, help="Directory where factual replay reports will be written.")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        replay_rows = _load_replay_rows(args.data)
+        instruments_by_symbol, nq_config, ym_config, gold_config = _build_default_runtime(replay_rows)
+        _run_corrected_validation_replay_rows(
+            replay_rows=replay_rows,
+            out_dir=args.out,
+            instruments_by_symbol=instruments_by_symbol,
+            nq_config=nq_config,
+            ym_config=ym_config,
+            gold_config=gold_config,
+        )
+    except ValueError as exc:
+        parser.exit(2, f"error: {exc}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
