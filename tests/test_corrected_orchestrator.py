@@ -189,6 +189,49 @@ def test_hard_risk_cap_blocks_oversize_trades() -> None:
     assert out.rejection_reason == "HARD_RISK_CAP_EXCEEDED"
 
 
+def test_incremental_indicator_updates_match_fresh_full_history_evaluation() -> None:
+    bars = _bars(datetime(2026, 1, 5, 9, 30, tzinfo=ET), count=130, base=20_480.0, slope=0.45)
+    instrument = _instrument("NQ", family=Family.EQUITIES, tick_size=0.25, tick_value=5.0)
+    request_kwargs = {
+        "instrument": instrument,
+        "session_start_equity": 100_000.0,
+        "realized_pnl": 0.0,
+        "open_positions": (),
+        "liquidity_ok": True,
+        "macro_blocked": False,
+        "pullback_price": 20_520.0,
+        "structure_break_price": 20_525.0,
+        "order_block_low": 20_518.0,
+        "order_block_high": 20_525.0,
+    }
+    incremental_orchestrator = _orchestrator()
+    incremental_output = None
+    for end in range(1, len(bars.index) + 1):
+        incremental_output = incremental_orchestrator.evaluate_nq(
+            NQEvaluationRequest(
+                bars_1m=bars.iloc[:end],
+                **request_kwargs,
+            )
+        )
+
+    fresh_output = _orchestrator().evaluate_nq(
+        NQEvaluationRequest(
+            bars_1m=bars,
+            **request_kwargs,
+        )
+    )
+
+    assert incremental_output is not None
+    assert type(incremental_output) is type(fresh_output)
+    assert tuple(event.reason for event in incremental_output.stage_events) == tuple(
+        event.reason for event in fresh_output.stage_events
+    )
+    if isinstance(incremental_output, AcceptedSignalOutput) and isinstance(fresh_output, AcceptedSignalOutput):
+        assert incremental_output.signal.side == fresh_output.signal.side
+        assert incremental_output.signal.score == fresh_output.signal.score
+        assert incremental_output.sizing.contracts == fresh_output.sizing.contracts
+
+
 def test_no_stage_silently_mutates_instrument_architecture_assumptions() -> None:
     orchestrator = _orchestrator()
     bars = _bars(datetime(2026, 1, 5, 9, 30, tzinfo=ET), count=130, base=42_180.0, slope=0.25)

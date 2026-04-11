@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, TextIO
 
 import pandas as pd
 
@@ -69,6 +70,8 @@ def run_corrected_validation_replay(
     nq_config: NQStrategyConfig,
     ym_config: YMStrategyConfig,
     gold_config: GoldStrategyConfig,
+    progress_every: int | None = None,
+    progress_stream: TextIO | None = None,
 ) -> ReplayValidationResult:
     replay_rows = _load_replay_rows(data_path)
     return _run_corrected_validation_replay_rows(
@@ -78,6 +81,8 @@ def run_corrected_validation_replay(
         nq_config=nq_config,
         ym_config=ym_config,
         gold_config=gold_config,
+        progress_every=progress_every,
+        progress_stream=progress_stream,
     )
 
 
@@ -89,68 +94,87 @@ def _run_corrected_validation_replay_rows(
     nq_config: NQStrategyConfig,
     ym_config: YMStrategyConfig,
     gold_config: GoldStrategyConfig,
+    progress_every: int | None = None,
+    progress_stream: TextIO | None = None,
 ) -> ReplayValidationResult:
+    output_dir = Path(out_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     orchestrator = CorrectedSignalOrchestrator(
         nq_config=nq_config,
         ym_config=ym_config,
         gold_config=gold_config,
     )
-    history_by_symbol: dict[str, list[dict[str, object]]] = {}
+    rows_by_symbol = {
+        symbol: frame.reset_index(drop=True)
+        for symbol, frame in replay_rows.groupby("symbol", sort=False)
+    }
+    processed_counts_by_symbol: dict[str, int] = {}
     records: list[ReplayValidationRecord] = []
+    total_rows = len(replay_rows.index)
+    interval = _progress_interval(total_rows=total_rows, requested=progress_every)
 
-    for row in replay_rows.itertuples(index=False):
-        symbol = str(row.symbol)
-        if symbol not in instruments_by_symbol:
-            continue
-
-        history = history_by_symbol.setdefault(symbol, [])
-        history.append(
-            {
-                "ts": row.ts,
-                "open": float(row.open),
-                "high": float(row.high),
-                "low": float(row.low),
-                "close": float(row.close),
-                "volume": float(row.volume),
-            }
+    try:
+        _log_progress(
+            stream=progress_stream,
+            message=f"starting corrected replay for {total_rows} rows -> {output_dir}",
         )
-        bars_1m = pd.DataFrame(history)
-        request = _build_request(
-            row=row,
-            bars_1m=bars_1m,
-            instrument=instruments_by_symbol[symbol],
-            nq_symbol=nq_config.symbol,
-            ym_symbol=ym_config.symbol,
-            gold_symbol=gold_config.symbol,
-        )
-        if request is None:
-            continue
+        for row_number, row in enumerate(replay_rows.itertuples(index=False), start=1):
+            symbol = str(row.symbol)
+            if symbol not in instruments_by_symbol:
+                continue
 
-        if isinstance(request, NQEvaluationRequest):
-            output = orchestrator.evaluate_nq(request)
-        elif isinstance(request, YMEvaluationRequest):
-            output = orchestrator.evaluate_ym(request)
-        else:
-            output = orchestrator.evaluate_gold(request)
-
-        session_state = output.session_state
-        records.append(
-            ReplayValidationRecord(
-                ts=row.ts.to_pydatetime(),
-                symbol=symbol,
-                outcome=_outcome_for_output(output),
-                rejection_reason=_reason_for_output(output),
-                strategy=_strategy_for_output(output),
-                effective_anchor_ts=effective_anchor_timestamp(session_state, ts=row.ts.to_pydatetime()),
-                current_session_date=session_state.current_session.session_date.isoformat(),
-                stage_events=output.stage_events,
+            processed_count = processed_counts_by_symbol.get(symbol, 0) + 1
+            processed_counts_by_symbol[symbol] = processed_count
+            bars_1m = rows_by_symbol[symbol].iloc[:processed_count]
+            request = _build_request(
+                row=row,
+                bars_1m=bars_1m,
+                instrument=instruments_by_symbol[symbol],
+                nq_symbol=nq_config.symbol,
+                ym_symbol=ym_config.symbol,
+                gold_symbol=gold_config.symbol,
             )
-        )
+            if request is None:
+                continue
+
+            if isinstance(request, NQEvaluationRequest):
+                output = orchestrator.evaluate_nq(request)
+            elif isinstance(request, YMEvaluationRequest):
+                output = orchestrator.evaluate_ym(request)
+            else:
+                output = orchestrator.evaluate_gold(request)
+
+            session_state = output.session_state
+            records.append(
+                ReplayValidationRecord(
+                    ts=row.ts.to_pydatetime(),
+                    symbol=symbol,
+                    outcome=_outcome_for_output(output),
+                    rejection_reason=_reason_for_output(output),
+                    strategy=_strategy_for_output(output),
+                    effective_anchor_ts=effective_anchor_timestamp(session_state, ts=row.ts.to_pydatetime()),
+                    current_session_date=session_state.current_session.session_date.isoformat(),
+                    stage_events=output.stage_events,
+                )
+            )
+
+            if interval is not None and (row_number % interval == 0 or row_number == total_rows):
+                _log_progress(
+                    stream=progress_stream,
+                    message=(
+                        f"processed {row_number}/{total_rows} rows "
+                        f"({(100.0 * row_number) / float(total_rows):.1f}%)"
+                    ),
+                )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Corrected replay failed while processing rows into '{output_dir}'"
+        ) from exc
 
     if not records:
         raise ValueError("Replay produced no evaluation records for the supplied input.")
 
-    events_path = _write_events(out_dir=out_dir, records=records)
+    events_path = _write_events(out_dir=output_dir, records=records)
     accepted_signals = build_accepted_signals(records)
     rejected_signals = build_rejected_signals(records)
     signals_by_instrument = build_signals_by_instrument(records)
@@ -169,7 +193,7 @@ def _run_corrected_validation_replay_rows(
     paths = {"events_path": events_path}
     paths.update(
         write_validation_reports(
-            out_dir=out_dir,
+            out_dir=output_dir,
             accepted_signals=accepted_signals,
             rejected_signals=rejected_signals,
             rejection_reason_counts=rejection_reason_counts,
@@ -177,6 +201,10 @@ def _run_corrected_validation_replay_rows(
             daily_halt_events=daily_halt_events,
             summary=summary,
         )
+    )
+    _log_progress(
+        stream=progress_stream,
+        message=f"wrote corrected replay reports to {output_dir}",
     )
     return ReplayValidationResult(records=tuple(records), summary=summary, paths=paths)
 
@@ -332,6 +360,20 @@ def build_validation_summary(
         "signal_frequency_by_instrument": signal_frequency_by_instrument.to_dict(orient="records"),
         "average_signal_frequency_by_instrument": signal_frequency_by_instrument.to_dict(orient="records"),
     }
+
+
+def _progress_interval(*, total_rows: int, requested: int | None) -> int | None:
+    if total_rows <= 0:
+        return None
+    if requested is not None:
+        return max(1, requested)
+    return max(1_000, total_rows // 20)
+
+
+def _log_progress(*, stream: TextIO | None, message: str) -> None:
+    if stream is None:
+        return
+    print(f"[corrected_replay] {message}", file=stream, flush=True)
 
 
 def _load_replay_rows(data_path: str | Path) -> pd.DataFrame:
@@ -618,16 +660,19 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    output_dir = Path(args.out)
+    output_dir.mkdir(parents=True, exist_ok=True)
     try:
         replay_rows = _load_replay_rows(args.data)
         instruments_by_symbol, nq_config, ym_config, gold_config = _build_default_runtime(replay_rows)
         _run_corrected_validation_replay_rows(
             replay_rows=replay_rows,
-            out_dir=args.out,
+            out_dir=output_dir,
             instruments_by_symbol=instruments_by_symbol,
             nq_config=nq_config,
             ym_config=ym_config,
             gold_config=gold_config,
+            progress_stream=sys.stderr,
         )
     except ValueError as exc:
         parser.exit(2, f"error: {exc}\n")

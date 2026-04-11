@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time
 from enum import Enum
-from typing import TypeAlias
+from typing import Iterable, TypeAlias
 
 import pandas as pd
 
@@ -15,9 +15,6 @@ from futures_bot.core.enums import Family, StrategyModule
 from futures_bot.core.types import InstrumentMeta, SignalCandidate
 from futures_bot.features import (
     InstrumentSessionState,
-    compute_anchored_vwap_1m,
-    compute_indicators_1m,
-    compute_indicators_5m,
     effective_anchor_timestamp,
     roll_instrument_session_state,
 )
@@ -157,6 +154,7 @@ class CorrectedSignalOrchestrator:
         self._gold_strategy = GoldSignalStrategy(gold_config)
         self._daily_halt_manager = DailyHaltManager()
         self._session_states: dict[str, InstrumentSessionState] = {}
+        self._indicator_caches: dict[str, _IncrementalIndicatorCache] = {}
 
     @property
     def nq_config(self) -> NQStrategyConfig:
@@ -467,39 +465,12 @@ class CorrectedSignalOrchestrator:
             )
         )
 
-        anchored_vwap = compute_anchored_vwap_1m(bars, anchor_ts=anchor_ts)
-        bars_with_vwap = bars.assign(session_vwap=anchored_vwap)
-        indicators_1m = compute_indicators_1m(bars_with_vwap)
-        bars_5m = _resample_5m(bars_with_vwap)
-        if bars_5m.empty or indicators_1m.empty:
-            stage_events.append(
-                StageEvent(
-                    stage=EvaluationStage.INDICATOR_UPDATE,
-                    status=StageStatus.REJECTED,
-                    reason="indicator_data_unavailable",
-                )
-            )
-            return stage_events, session_state, _RejectedStageData(reason="indicator_data_unavailable")
-        indicators_5m = compute_indicators_5m(bars_5m)
-        if indicators_5m.empty:
-            stage_events.append(
-                StageEvent(
-                    stage=EvaluationStage.INDICATOR_UPDATE,
-                    status=StageStatus.REJECTED,
-                    reason="indicator_data_unavailable",
-                )
-            )
-            return stage_events, session_state, _RejectedStageData(reason="indicator_data_unavailable")
-
-        latest_anchored_vwap = float(bars_with_vwap["session_vwap"].iloc[-1])
-        latest_atr_1m = float(indicators_1m["ATR_14_1m"].iloc[-1])
-        latest_ema_fast = float(indicators_5m["EMA9_5m"].iloc[-1])
-        latest_ema_slow = float(indicators_5m["EMA21_5m"].iloc[-1])
-        latest_atr_5m = float(indicators_5m["ATR_14_5m"].iloc[-1])
-        if not all(
-            math.isfinite(value)
-            for value in (latest_anchored_vwap, latest_atr_1m, latest_ema_fast, latest_ema_slow, latest_atr_5m)
-        ):
+        prepared_data = self._prepare_indicator_data(
+            instrument_symbol=request.instrument.symbol,
+            bars=bars,
+            anchor_ts=anchor_ts,
+        )
+        if isinstance(prepared_data, _RejectedStageData):
             stage_events.append(
                 StageEvent(
                     stage=EvaluationStage.INDICATOR_UPDATE,
@@ -515,15 +486,145 @@ class CorrectedSignalOrchestrator:
                 reason="indicators_updated",
             )
         )
-        return stage_events, session_state, _PreparedIndicatorData(
+        return stage_events, session_state, prepared_data
+
+    def _prepare_indicator_data(
+        self,
+        *,
+        instrument_symbol: str,
+        bars: pd.DataFrame,
+        anchor_ts: datetime,
+    ) -> _PreparedIndicatorData | _RejectedStageData:
+        cache = self._indicator_caches.get(instrument_symbol)
+        latest_ts = pd.Timestamp(bars["ts"].iloc[-1]).to_pydatetime()
+        row_count = len(bars.index)
+
+        if cache is None or self._cache_requires_rebuild(cache=cache, bars=bars, latest_ts=latest_ts):
+            cache = _IncrementalIndicatorCache()
+            self._indicator_caches[instrument_symbol] = cache
+            cache.reset_active_session(anchor_ts)
+            self._rebuild_indicator_cache(cache=cache, bars=bars, anchor_ts=anchor_ts)
+        elif row_count == cache.processed_count + 1:
+            if cache.active_anchor_ts != anchor_ts:
+                cache.reset_active_session(anchor_ts)
+            self._apply_bar_to_indicator_cache(cache=cache, row=bars.iloc[-1], anchor_ts=anchor_ts)
+        elif cache.active_anchor_ts != anchor_ts:
+            cache = _IncrementalIndicatorCache()
+            self._indicator_caches[instrument_symbol] = cache
+            cache.reset_active_session(anchor_ts)
+            self._rebuild_indicator_cache(cache=cache, bars=bars, anchor_ts=anchor_ts)
+
+        if not all(
+            math.isfinite(value)
+            for value in (
+                cache.latest_anchored_vwap,
+                cache.latest_atr_1m,
+                cache.latest_ema_fast,
+                cache.latest_ema_slow,
+                cache.latest_atr_5m,
+            )
+        ):
+            return _RejectedStageData(reason="indicator_data_unavailable")
+        return _PreparedIndicatorData(
             latest_ts=latest_ts,
             latest_close=float(bars["close"].iloc[-1]),
-            anchored_vwap=latest_anchored_vwap,
-            ema_fast=latest_ema_fast,
-            ema_slow=latest_ema_slow,
-            atr_5m=latest_atr_5m,
-            atr_14_1m_price=latest_atr_1m,
+            anchored_vwap=cache.latest_anchored_vwap,
+            ema_fast=cache.latest_ema_fast,
+            ema_slow=cache.latest_ema_slow,
+            atr_5m=cache.latest_atr_5m,
+            atr_14_1m_price=cache.latest_atr_1m,
         )
+
+    def _cache_requires_rebuild(
+        self,
+        *,
+        cache: _IncrementalIndicatorCache,
+        bars: pd.DataFrame,
+        latest_ts: datetime,
+    ) -> bool:
+        row_count = len(bars.index)
+        if cache.processed_count == 0:
+            return True
+        if row_count < cache.processed_count:
+            return True
+        if row_count == cache.processed_count:
+            return cache.last_ts != latest_ts
+        if row_count != cache.processed_count + 1:
+            return True
+        next_ts = pd.Timestamp(bars["ts"].iloc[-1]).to_pydatetime()
+        if cache.last_ts is None:
+            return True
+        return next_ts <= cache.last_ts
+
+    def _rebuild_indicator_cache(
+        self,
+        *,
+        cache: _IncrementalIndicatorCache,
+        bars: pd.DataFrame,
+        anchor_ts: datetime,
+    ) -> None:
+        for row in bars.itertuples(index=False):
+            self._apply_bar_to_indicator_cache(cache=cache, row=row, anchor_ts=anchor_ts)
+
+    def _apply_bar_to_indicator_cache(
+        self,
+        *,
+        cache: _IncrementalIndicatorCache,
+        row: object,
+        anchor_ts: datetime,
+    ) -> None:
+        ts = pd.Timestamp(_row_value(row, "ts")).to_pydatetime()
+        open_price = float(_row_value(row, "open"))
+        high_price = float(_row_value(row, "high"))
+        low_price = float(_row_value(row, "low"))
+        close_price = float(_row_value(row, "close"))
+        volume = float(_row_value(row, "volume"))
+
+        tr_1m = _compute_true_range_value(
+            high=high_price,
+            low=low_price,
+            previous_close=cache.last_close_1m,
+        )
+        cache.latest_atr_1m = cache.atr_14_1m_window.append(tr_1m)
+        cache.last_close_1m = close_price
+        cache.last_ts = ts
+        cache.processed_count += 1
+
+        if ts < anchor_ts:
+            return
+
+        cache.active_cum_pv += close_price * volume
+        cache.active_cum_v += volume
+        if cache.active_cum_v <= 0.0:
+            cache.latest_anchored_vwap = math.nan
+            return
+
+        cache.latest_anchored_vwap = cache.active_cum_pv / cache.active_cum_v
+        bucket_start = pd.Timestamp(ts).floor("5min")
+        if not cache.active_5m_bars or cache.active_5m_bars[-1].bucket_start != bucket_start:
+            cache.active_5m_bars.append(
+                _FiveMinuteBar(
+                    bucket_start=bucket_start,
+                    open=open_price,
+                    high=high_price,
+                    low=low_price,
+                    close=close_price,
+                    volume=volume,
+                    session_vwap=cache.latest_anchored_vwap,
+                )
+            )
+        else:
+            current_bar = cache.active_5m_bars[-1]
+            current_bar.high = max(current_bar.high, high_price)
+            current_bar.low = min(current_bar.low, low_price)
+            current_bar.close = close_price
+            current_bar.volume += volume
+            current_bar.session_vwap = cache.latest_anchored_vwap
+
+        close_values = [bar.close for bar in cache.active_5m_bars]
+        cache.latest_ema_fast = _ema_latest(close_values, span=9)
+        cache.latest_ema_slow = _ema_latest(close_values, span=21)
+        cache.latest_atr_5m = _rolling_atr_latest(cache.active_5m_bars, window=14)
 
     def _liquidity_gate(
         self,
@@ -777,22 +878,106 @@ def _prepare_bars(bars: pd.DataFrame) -> pd.DataFrame:
     missing = required.difference(bars.columns)
     if missing:
         raise ValueError(f"bars_1m missing required columns: {sorted(missing)}")
-    prepared = bars.copy()
-    prepared["ts"] = pd.to_datetime(prepared["ts"], errors="raise")
+    prepared = bars
+    ts = prepared["ts"]
+    if not pd.api.types.is_datetime64_any_dtype(ts):
+        prepared = bars.copy()
+        prepared["ts"] = pd.to_datetime(prepared["ts"], errors="raise")
+        ts = prepared["ts"]
+    if ts.is_monotonic_increasing:
+        if isinstance(prepared.index, pd.RangeIndex) and prepared.index.start == 0 and prepared.index.step == 1:
+            return prepared
+        return prepared.reset_index(drop=True)
+    if prepared is bars:
+        prepared = bars.copy()
     return prepared.sort_values("ts", kind="mergesort").reset_index(drop=True)
 
 
-def _resample_5m(bars: pd.DataFrame) -> pd.DataFrame:
-    indexed = bars.set_index("ts")
-    resampled = indexed.resample("5min").agg(
-        {
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-            "session_vwap": "last",
-        }
-    )
-    resampled = resampled.dropna(subset=["open", "high", "low", "close", "session_vwap"]).reset_index()
-    return resampled
+@dataclass(slots=True)
+class _RollingMeanWindow:
+    window: int
+    values: list[float] = field(default_factory=list)
+    sum_value: float = 0.0
+
+    def append(self, value: float) -> float:
+        self.values.append(value)
+        self.sum_value += value
+        if len(self.values) > self.window:
+            self.sum_value -= self.values.pop(0)
+        if len(self.values) < self.window:
+            return math.nan
+        return self.sum_value / float(self.window)
+
+
+@dataclass(slots=True)
+class _FiveMinuteBar:
+    bucket_start: pd.Timestamp
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    session_vwap: float
+
+
+@dataclass(slots=True)
+class _IncrementalIndicatorCache:
+    processed_count: int = 0
+    last_ts: datetime | None = None
+    last_close_1m: float | None = None
+    latest_atr_1m: float = math.nan
+    atr_14_1m_window: _RollingMeanWindow = field(default_factory=lambda: _RollingMeanWindow(window=14))
+    active_anchor_ts: datetime | None = None
+    active_cum_pv: float = 0.0
+    active_cum_v: float = 0.0
+    latest_anchored_vwap: float = math.nan
+    active_5m_bars: list[_FiveMinuteBar] = field(default_factory=list)
+    latest_ema_fast: float = math.nan
+    latest_ema_slow: float = math.nan
+    latest_atr_5m: float = math.nan
+
+    def reset_active_session(self, anchor_ts: datetime | None) -> None:
+        self.active_anchor_ts = anchor_ts
+        self.active_cum_pv = 0.0
+        self.active_cum_v = 0.0
+        self.latest_anchored_vwap = math.nan
+        self.active_5m_bars = []
+        self.latest_ema_fast = math.nan
+        self.latest_ema_slow = math.nan
+        self.latest_atr_5m = math.nan
+
+
+def _row_value(row: object, key: str) -> object:
+    if hasattr(row, key):
+        return getattr(row, key)
+    return row[key]
+
+
+def _compute_true_range_value(*, high: float, low: float, previous_close: float | None) -> float:
+    if previous_close is None:
+        return high - low
+    return max(high - low, abs(high - previous_close), abs(low - previous_close))
+
+
+def _ema_latest(values: Iterable[float], *, span: int) -> float:
+    sequence = list(values)
+    if len(sequence) < span:
+        return math.nan
+    alpha = 2.0 / (float(span) + 1.0)
+    ema_value = sequence[0]
+    for value in sequence[1:]:
+        ema_value = (alpha * value) + ((1.0 - alpha) * ema_value)
+    return ema_value
+
+
+def _rolling_atr_latest(bars: list[_FiveMinuteBar], *, window: int) -> float:
+    if len(bars) < window:
+        return math.nan
+    tr_values: list[float] = []
+    previous_close: float | None = None
+    for bar in bars:
+        tr_values.append(_compute_true_range_value(high=bar.high, low=bar.low, previous_close=previous_close))
+        previous_close = bar.close
+    if len(tr_values) < window:
+        return math.nan
+    return sum(tr_values[-window:]) / float(window)

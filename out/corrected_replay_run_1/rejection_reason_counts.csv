@@ -1,0 +1,7 @@
+rejection_reason,count
+HARD_RISK_CAP_EXCEEDED,7253
+ema_alignment_failed,3282
+indicator_data_unavailable,3300
+no_mean_reversion_or_ema_continuation_setup,4739
+no_mean_reversion_or_structural_setup,8628
+order_block_alignment_failed,8827

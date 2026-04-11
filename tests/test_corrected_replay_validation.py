@@ -201,6 +201,40 @@ def test_replay_determinism_and_identical_inputs_produce_identical_outputs(tmp_p
     assert result_a.paths["summary_path"].name == "summary.json"
 
 
+def test_corrected_replay_cli_writes_reports_and_out_dir(tmp_path: Path) -> None:
+    data = tmp_path / "validation.csv"
+    out_dir = tmp_path / "cli_out"
+    _write_validation_csv(data)
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(REPO_ROOT / "src")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "futures_bot.backtest.corrected_replay",
+            "--data",
+            str(data),
+            "--out",
+            str(out_dir),
+        ],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert out_dir.exists()
+    assert (out_dir / "summary.json").exists()
+    assert (out_dir / "accepted_signals.csv").exists()
+    assert (out_dir / "rejected_signals.csv").exists()
+    assert (out_dir / "validation_events.ndjson").exists()
+    assert "processed" in completed.stderr
+
+
 def test_rejection_reason_counts_are_stable(tmp_path: Path) -> None:
     data = tmp_path / "validation.csv"
     out_dir = tmp_path / "out"
