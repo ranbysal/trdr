@@ -340,12 +340,19 @@ def _load_replay_rows(data_path: str | Path) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Replay CSV missing required columns: {sorted(missing)}")
     rows = rows.copy()
-    rows["symbol"] = rows["symbol"].astype(str).str.strip().str.upper()
+    rows["symbol"] = rows["symbol"].astype(str).str.strip().str.upper().map(_normalize_replay_symbol)
     rows["ts"] = pd.to_datetime(rows["timestamp_et"], errors="raise")
     for column in ("open", "high", "low", "close", "volume"):
         rows[column] = pd.to_numeric(rows[column], errors="raise")
     rows = rows.sort_values(["ts", "symbol"], kind="mergesort").reset_index(drop=True)
     return rows
+
+
+def _normalize_replay_symbol(symbol: str) -> str:
+    normalized = str(symbol).strip().upper()
+    if normalized == "GOLD":
+        return "MGC"
+    return normalized
 
 
 def _build_request(
