@@ -17,6 +17,7 @@ from futures_bot.backtest.validation_reports import write_validation_reports
 from futures_bot.config.models import GoldStrategyConfig, NQStrategyConfig, YMStrategyConfig
 from futures_bot.core.enums import Family
 from futures_bot.core.types import InstrumentMeta
+from futures_bot.data.session_windows import is_equities_rth, is_metals_strategy_window
 from futures_bot.features import effective_anchor_timestamp
 from futures_bot.pipeline.corrected_orchestrator import (
     AcceptedSignalOutput,
@@ -221,6 +222,19 @@ def _run_corrected_validation_replay_rows(
     accepted_signal_diagnostics = build_accepted_signal_diagnostics(records)
     accepted_bars = build_accepted_bars(accepted_signal_diagnostics.accepted_bar_diagnostics)
     accepted_signals = build_accepted_signals(accepted_signal_diagnostics.accepted_bar_diagnostics)
+    actionable_signal_audit = build_actionable_signal_audit(accepted_signal_diagnostics.accepted_bar_diagnostics)
+    actionable_signal_breakdown = build_actionable_signal_breakdown(actionable_signal_audit)
+    actionable_signals_by_instrument_and_session = build_actionable_signals_by_instrument_and_session(
+        actionable_signal_audit
+    )
+    actionable_signals_by_instrument_and_strategy = build_actionable_signals_by_instrument_and_strategy(
+        actionable_signal_audit
+    )
+    actionable_signals_by_instrument_and_hour = build_actionable_signals_by_instrument_and_hour(
+        actionable_signal_audit
+    )
+    actionable_signals_by_date = build_actionable_signals_by_date(actionable_signal_audit)
+    common_actionable_setup_fingerprints = build_common_actionable_setup_fingerprints(actionable_signal_audit)
     rejected_signals = build_rejected_signals(records)
     accepted_bars_by_instrument = build_accepted_bars_by_instrument(accepted_signal_diagnostics.raw_accepted_records)
     signals_by_instrument = build_signals_by_instrument(accepted_signal_diagnostics.unique_accepted_records)
@@ -262,6 +276,13 @@ def _run_corrected_validation_replay_rows(
             out_dir=output_dir,
             accepted_bars=accepted_bars,
             accepted_signals=accepted_signals,
+            actionable_signal_breakdown=actionable_signal_breakdown,
+            actionable_setup_fingerprints=actionable_signal_audit,
+            actionable_signals_by_instrument_and_session=actionable_signals_by_instrument_and_session,
+            actionable_signals_by_instrument_and_strategy=actionable_signals_by_instrument_and_strategy,
+            actionable_signals_by_instrument_and_hour=actionable_signals_by_instrument_and_hour,
+            actionable_signals_by_date=actionable_signals_by_date,
+            common_actionable_setup_fingerprints=common_actionable_setup_fingerprints,
             rejected_signals=rejected_signals,
             rejection_reason_counts=rejection_reason_counts,
             rejection_reason_counts_by_instrument=rejection_reason_counts_by_instrument,
@@ -341,6 +362,189 @@ def build_accepted_signals(records: pd.DataFrame) -> pd.DataFrame:
     if accepted.empty:
         return accepted
     return accepted.loc[accepted["actionable_status"] == "new_actionable_signal"].reset_index(drop=True)
+
+
+def build_actionable_signal_audit(records: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "ts",
+        "instrument",
+        "strategy",
+        "setup",
+        "strategy_path",
+        "direction",
+        "session",
+        "trading_date",
+        "hour_bucket",
+        "actionable_signal_id",
+        "setup_fingerprint",
+        "deduped_from_prior_raw_eligibility",
+        "prior_matching_raw_eligibility_count",
+        "deduped_from_raw_eligibility_cluster",
+        "raw_eligibility_count",
+        "suppressed_raw_eligibility_count",
+        "stage_outcome_summary",
+    ]
+    if records.empty:
+        return pd.DataFrame(columns=columns)
+
+    frame = records.copy()
+    frame["ts_dt"] = pd.to_datetime(frame["ts"], errors="raise")
+    frame["trading_date"] = frame.apply(_trading_date_for_accepted_bar_row, axis=1)
+    frame["strategy_path"] = frame.apply(_strategy_path_for_accepted_bar_row, axis=1)
+    frame["direction"] = frame["side"].astype(str)
+    frame["session"] = frame["ts_dt"].combine(frame["instrument"], _session_bucket_for_instrument)
+    frame["hour_bucket"] = frame["ts_dt"].dt.tz_convert("America/New_York").dt.strftime("%H:00")
+    frame["stage_outcome_summary"] = frame["stage_events_json"].map(_summarize_stage_events_json)
+    frame = frame.sort_values(["instrument", "ts_dt", "actionable_signal_id"], kind="mergesort").reset_index(drop=True)
+
+    grouping = [
+        "instrument",
+        "strategy_path",
+        "direction",
+        "session",
+        "trading_date",
+        "setup_fingerprint",
+    ]
+    frame["prior_matching_raw_eligibility_count"] = frame.groupby(grouping, dropna=False).cumcount()
+    raw_counts = frame.groupby("actionable_signal_id", dropna=False).size().rename("raw_eligibility_count")
+    frame = frame.merge(raw_counts.reset_index(), how="left", on="actionable_signal_id")
+    frame["suppressed_raw_eligibility_count"] = frame["raw_eligibility_count"] - 1
+    frame["deduped_from_prior_raw_eligibility"] = frame["prior_matching_raw_eligibility_count"] > 0
+    frame["deduped_from_raw_eligibility_cluster"] = frame["suppressed_raw_eligibility_count"] > 0
+
+    actionable = frame.loc[frame["actionable_status"] == "new_actionable_signal"].copy()
+    if actionable.empty:
+        return pd.DataFrame(columns=columns)
+    actionable["deduped_from_prior_raw_eligibility"] = actionable["deduped_from_prior_raw_eligibility"].astype(bool)
+    actionable["deduped_from_raw_eligibility_cluster"] = actionable["deduped_from_raw_eligibility_cluster"].astype(bool)
+    return actionable.loc[:, columns].reset_index(drop=True)
+
+
+def build_actionable_signal_breakdown(actionable_signal_audit: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "instrument",
+        "strategy",
+        "setup",
+        "strategy_path",
+        "direction",
+        "session",
+        "trading_date",
+        "hour_bucket",
+        "actionable_signal_count",
+    ]
+    if actionable_signal_audit.empty:
+        return pd.DataFrame(columns=columns)
+    return (
+        actionable_signal_audit.groupby(
+            ["instrument", "strategy", "setup", "strategy_path", "direction", "session", "trading_date", "hour_bucket"],
+            dropna=False,
+        )
+        .size()
+        .rename("actionable_signal_count")
+        .reset_index()
+        .sort_values(
+            ["instrument", "strategy_path", "direction", "session", "trading_date", "hour_bucket"],
+            kind="mergesort",
+        )
+        .reset_index(drop=True)
+    )
+
+
+def build_actionable_signals_by_instrument_and_session(actionable_signal_audit: pd.DataFrame) -> pd.DataFrame:
+    columns = ["instrument", "session", "actionable_signal_count"]
+    if actionable_signal_audit.empty:
+        return pd.DataFrame(columns=columns)
+    return (
+        actionable_signal_audit.groupby(["instrument", "session"], dropna=False)
+        .size()
+        .rename("actionable_signal_count")
+        .reset_index()
+        .sort_values(["instrument", "session"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+
+
+def build_actionable_signals_by_instrument_and_strategy(actionable_signal_audit: pd.DataFrame) -> pd.DataFrame:
+    columns = ["instrument", "strategy", "setup", "strategy_path", "actionable_signal_count"]
+    if actionable_signal_audit.empty:
+        return pd.DataFrame(columns=columns)
+    return (
+        actionable_signal_audit.groupby(["instrument", "strategy", "setup", "strategy_path"], dropna=False)
+        .size()
+        .rename("actionable_signal_count")
+        .reset_index()
+        .sort_values(["instrument", "strategy_path"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+
+
+def build_actionable_signals_by_instrument_and_hour(actionable_signal_audit: pd.DataFrame) -> pd.DataFrame:
+    columns = ["instrument", "hour_bucket", "actionable_signal_count"]
+    if actionable_signal_audit.empty:
+        return pd.DataFrame(columns=columns)
+    return (
+        actionable_signal_audit.groupby(["instrument", "hour_bucket"], dropna=False)
+        .size()
+        .rename("actionable_signal_count")
+        .reset_index()
+        .sort_values(["instrument", "hour_bucket"], kind="mergesort")
+        .reset_index(drop=True)
+    )
+
+
+def build_actionable_signals_by_date(actionable_signal_audit: pd.DataFrame) -> pd.DataFrame:
+    columns = ["trading_date", "actionable_signal_count"]
+    if actionable_signal_audit.empty:
+        return pd.DataFrame(columns=columns)
+    return (
+        actionable_signal_audit.groupby(["trading_date"], dropna=False)
+        .size()
+        .rename("actionable_signal_count")
+        .reset_index()
+        .sort_values("trading_date", kind="mergesort")
+        .reset_index(drop=True)
+    )
+
+
+def build_common_actionable_setup_fingerprints(actionable_signal_audit: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "instrument",
+        "strategy",
+        "setup",
+        "strategy_path",
+        "direction",
+        "session",
+        "setup_fingerprint",
+        "actionable_signal_count",
+        "distinct_trading_dates",
+        "total_raw_eligibility_count",
+        "total_suppressed_raw_eligibility_count",
+        "first_ts",
+        "last_ts",
+    ]
+    if actionable_signal_audit.empty:
+        return pd.DataFrame(columns=columns)
+    return (
+        actionable_signal_audit.groupby(
+            ["instrument", "strategy", "setup", "strategy_path", "direction", "session", "setup_fingerprint"],
+            dropna=False,
+        )
+        .agg(
+            actionable_signal_count=("actionable_signal_id", "nunique"),
+            distinct_trading_dates=("trading_date", "nunique"),
+            total_raw_eligibility_count=("raw_eligibility_count", "sum"),
+            total_suppressed_raw_eligibility_count=("suppressed_raw_eligibility_count", "sum"),
+            first_ts=("ts", "min"),
+            last_ts=("ts", "max"),
+        )
+        .reset_index()
+        .sort_values(
+            ["actionable_signal_count", "total_raw_eligibility_count", "instrument", "strategy_path"],
+            ascending=[False, False, True, True],
+            kind="mergesort",
+        )
+        .reset_index(drop=True)
+    )
 
 
 def build_accepted_bars_by_instrument(
@@ -1051,6 +1255,56 @@ def _accepted_bar_row(
         "suppression_reason": suppression_reason,
         "stage_events_json": _stage_events_json(record.stage_events),
     }
+
+
+def _trading_date_for_accepted_bar_row(row: pd.Series) -> str:
+    anchor_ts = row.get("effective_anchor_ts")
+    if anchor_ts is not None and not pd.isna(anchor_ts):
+        return pd.Timestamp(anchor_ts).date().isoformat()
+    current_session_date = row.get("current_session_date")
+    if current_session_date is None or pd.isna(current_session_date):
+        return pd.Timestamp(row["ts"]).date().isoformat()
+    return str(current_session_date)
+
+
+def _strategy_path_for_accepted_bar_row(row: pd.Series) -> str:
+    strategy = str(row.get("strategy") or "").strip()
+    setup = str(row.get("setup") or "").strip()
+    if strategy and setup:
+        return f"{strategy}/{setup}"
+    return strategy or setup
+
+
+def _session_bucket_for_instrument(ts: pd.Timestamp, instrument: str) -> str:
+    ts_value = ts.to_pydatetime() if isinstance(ts, pd.Timestamp) else ts
+    family = _family_for_replay_symbol(str(instrument))
+    if family is Family.EQUITIES:
+        return "regular" if is_equities_rth(ts_value) else "extended"
+    if family is Family.METALS:
+        return "regular" if is_metals_strategy_window(ts_value) else "extended"
+    return "unknown"
+
+
+def _family_for_replay_symbol(symbol: str) -> Family:
+    if symbol in {"NQ", "YM"}:
+        return Family.EQUITIES
+    if symbol == "GOLD":
+        return Family.METALS
+    return _default_instrument(symbol).family
+
+
+def _summarize_stage_events_json(payload: str) -> str:
+    raw_events = json.loads(payload)
+    parts: list[str] = []
+    for event in raw_events:
+        stage = str(event.get("stage", "")).strip()
+        status = str(event.get("status", "")).strip()
+        reason = str(event.get("reason", "")).strip()
+        if reason and reason != status:
+            parts.append(f"{stage}={status}:{reason}")
+        else:
+            parts.append(f"{stage}={status}")
+    return " | ".join(parts)
 
 
 def _setup_fingerprint_for_output(

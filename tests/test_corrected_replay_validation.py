@@ -423,6 +423,13 @@ def test_corrected_replay_cli_writes_required_reports(tmp_path: Path) -> None:
         "summary.json",
         "accepted_bars.csv",
         "accepted_signals.csv",
+        "actionable_signal_breakdown.csv",
+        "actionable_setup_fingerprints.csv",
+        "actionable_signals_by_instrument_and_session.csv",
+        "actionable_signals_by_instrument_and_strategy.csv",
+        "actionable_signals_by_instrument_and_hour.csv",
+        "actionable_signals_by_date.csv",
+        "common_actionable_setup_fingerprints.csv",
         "rejected_signals.csv",
         "rejection_reason_counts.csv",
         "rejection_reason_counts_by_instrument.csv",
@@ -439,6 +446,103 @@ def test_corrected_replay_cli_writes_required_reports(tmp_path: Path) -> None:
     assert summary["accepted_signal_count"] >= 1
     assert "risk_skip_count" in summary
     assert summary["daily_halt_event_count"] >= 1
+
+
+def test_actionable_signal_audit_reports_are_written_with_expected_columns(tmp_path: Path) -> None:
+    data = tmp_path / "validation.csv"
+    out_dir = tmp_path / "out"
+    _write_validation_csv(data, gold_realized_pnl=0.0, include_gold_open_position=False)
+    nq, ym, gold = _configs()
+
+    result = run_corrected_validation_replay(
+        data_path=data,
+        out_dir=out_dir,
+        instruments_by_symbol=_instruments(),
+        nq_config=nq,
+        ym_config=ym,
+        gold_config=gold,
+    )
+
+    fingerprints = pd.read_csv(result.paths["actionable_setup_fingerprints_path"])
+    breakdown = pd.read_csv(result.paths["actionable_signal_breakdown_path"])
+    by_session = pd.read_csv(result.paths["actionable_signals_by_instrument_and_session_path"])
+    by_strategy = pd.read_csv(result.paths["actionable_signals_by_instrument_and_strategy_path"])
+    by_hour = pd.read_csv(result.paths["actionable_signals_by_instrument_and_hour_path"])
+    by_date = pd.read_csv(result.paths["actionable_signals_by_date_path"])
+    common_fingerprints = pd.read_csv(result.paths["common_actionable_setup_fingerprints_path"])
+
+    assert not fingerprints.empty
+    assert not breakdown.empty
+    assert not by_session.empty
+    assert not by_strategy.empty
+    assert not by_hour.empty
+    assert not by_date.empty
+    assert not common_fingerprints.empty
+
+    assert {
+        "ts",
+        "instrument",
+        "strategy",
+        "setup",
+        "strategy_path",
+        "direction",
+        "session",
+        "trading_date",
+        "hour_bucket",
+        "setup_fingerprint",
+        "deduped_from_prior_raw_eligibility",
+        "stage_outcome_summary",
+    } <= set(fingerprints.columns)
+    assert {
+        "instrument",
+        "strategy_path",
+        "direction",
+        "session",
+        "trading_date",
+        "hour_bucket",
+        "actionable_signal_count",
+    } <= set(breakdown.columns)
+    assert {"instrument", "session", "actionable_signal_count"} == set(by_session.columns)
+    assert {"instrument", "strategy", "setup", "strategy_path", "actionable_signal_count"} == set(by_strategy.columns)
+    assert {"instrument", "hour_bucket", "actionable_signal_count"} == set(by_hour.columns)
+    assert {"trading_date", "actionable_signal_count"} == set(by_date.columns)
+    assert {
+        "instrument",
+        "strategy_path",
+        "setup_fingerprint",
+        "actionable_signal_count",
+        "distinct_trading_dates",
+        "total_raw_eligibility_count",
+    } <= set(common_fingerprints.columns)
+
+    assert {"NQ", "YM", "GOLD"} <= set(fingerprints["instrument"])
+    assert fingerprints["strategy_path"].str.contains("/").all()
+    assert fingerprints["session"].isin({"regular", "extended"}).all()
+
+
+def test_gold_replay_audit_reports_capture_dedupe_clusters(tmp_path: Path) -> None:
+    data = tmp_path / "gold.csv"
+    out_dir = tmp_path / "out"
+    _write_repetitive_gold_csv(data)
+    nq, ym, gold = _configs()
+
+    result = run_corrected_validation_replay(
+        data_path=data,
+        out_dir=out_dir,
+        instruments_by_symbol=_instruments(),
+        nq_config=nq,
+        ym_config=ym,
+        gold_config=gold,
+    )
+
+    fingerprints = pd.read_csv(result.paths["actionable_setup_fingerprints_path"])
+    common_fingerprints = pd.read_csv(result.paths["common_actionable_setup_fingerprints_path"])
+
+    assert len(fingerprints.index) == 1
+    assert bool(fingerprints.iloc[0]["deduped_from_raw_eligibility_cluster"])
+    assert int(fingerprints.iloc[0]["suppressed_raw_eligibility_count"]) >= 1
+    assert int(common_fingerprints.iloc[0]["total_suppressed_raw_eligibility_count"]) >= 1
+    assert int(common_fingerprints.iloc[0]["actionable_signal_count"]) >= 1
 
 
 def test_corrected_replay_cli_fails_loudly_when_required_columns_are_missing(tmp_path: Path) -> None:

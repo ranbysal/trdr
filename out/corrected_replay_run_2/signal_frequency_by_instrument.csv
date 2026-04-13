@@ -1,4 +1,4 @@
-symbol,active_days,accepted_signal_count,accepted_signals_per_active_day
-MGC,11,2483,225.72727272727272
-NQ,12,0,0.0
-YM,12,0,0.0
+instrument,active_days,accepted_bar_count,actionable_signal_count,accepted_bars_per_active_day,actionable_signals_per_active_day
+GOLD,11,2483,193,225.72727272727272,17.545454545454547
+NQ,12,214,214,17.833333333333332,17.833333333333332
+YM,12,6899,446,574.9166666666666,37.166666666666664
