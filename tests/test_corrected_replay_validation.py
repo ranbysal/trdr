@@ -35,7 +35,12 @@ def _instrument(symbol: str, *, family: Family, tick_size: float, tick_value: fl
     )
 
 
-def _write_validation_csv(path: Path) -> None:
+def _write_validation_csv(
+    path: Path,
+    *,
+    gold_realized_pnl: float = -1400.0,
+    include_gold_open_position: bool = True,
+) -> None:
     fields = [
         "timestamp_et",
         "symbol",
@@ -123,12 +128,12 @@ def _write_validation_csv(path: Path) -> None:
                     "order_block_low": "2639.8",
                     "order_block_high": "2640.2",
                     "session_start_equity": "100000",
-                    "realized_pnl": "-1400",
-                    "open_position_symbol": "NQ",
-                    "open_position_quantity": "1",
-                    "open_position_avg_entry_price": "20000",
-                    "open_position_mark_price": "19990",
-                    "open_position_point_value": "20",
+                    "realized_pnl": f"{gold_realized_pnl}",
+                    "open_position_symbol": "NQ" if include_gold_open_position else "",
+                    "open_position_quantity": "1" if include_gold_open_position else "",
+                    "open_position_avg_entry_price": "20000" if include_gold_open_position else "",
+                    "open_position_mark_price": "19990" if include_gold_open_position else "",
+                    "open_position_point_value": "20" if include_gold_open_position else "",
                 }
             )
 
@@ -215,6 +220,52 @@ def _write_repetitive_gold_csv(path: Path) -> None:
             )
 
 
+def _write_gold_fingerprint_shift_csv(path: Path) -> None:
+    fields = [
+        "timestamp_et",
+        "symbol",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "liquidity_ok",
+        "macro_blocked",
+        "pullback_price",
+        "structure_break_price",
+        "order_block_low",
+        "order_block_high",
+        "session_start_equity",
+        "realized_pnl",
+    ]
+    start = datetime(2026, 1, 5, 8, 0, tzinfo=ET)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for i in range(160):
+            ts = start + timedelta(minutes=i)
+            shifted = i >= 120
+            writer.writerow(
+                {
+                    "timestamp_et": ts.isoformat(),
+                    "symbol": "MGC",
+                    "open": "2640.0",
+                    "high": "2640.2",
+                    "low": "2639.8",
+                    "close": "2640.0",
+                    "volume": "1000",
+                    "liquidity_ok": "true",
+                    "macro_blocked": "false",
+                    "pullback_price": "2639.9" if not shifted else "2640.0",
+                    "structure_break_price": "2641.0" if not shifted else "2642.0",
+                    "order_block_low": "2639.7" if not shifted else "2639.8",
+                    "order_block_high": "2640.1" if not shifted else "2640.2",
+                    "session_start_equity": "100000",
+                    "realized_pnl": "0",
+                }
+            )
+
+
 def test_replay_determinism_and_identical_inputs_produce_identical_outputs(tmp_path: Path) -> None:
     data = tmp_path / "validation.csv"
     out_a = tmp_path / "out_a"
@@ -275,6 +326,7 @@ def test_corrected_replay_cli_writes_reports_and_out_dir(tmp_path: Path) -> None
 
     assert completed.returncode == 0, completed.stderr
     assert out_dir.exists()
+    assert (out_dir / "accepted_bars.csv").exists()
     assert (out_dir / "summary.json").exists()
     assert (out_dir / "accepted_signals.csv").exists()
     assert (out_dir / "rejected_signals.csv").exists()
@@ -369,6 +421,7 @@ def test_corrected_replay_cli_writes_required_reports(tmp_path: Path) -> None:
     assert completed.returncode == 0, completed.stderr
     expected_files = {
         "summary.json",
+        "accepted_bars.csv",
         "accepted_signals.csv",
         "rejected_signals.csv",
         "rejection_reason_counts.csv",
@@ -382,6 +435,7 @@ def test_corrected_replay_cli_writes_required_reports(tmp_path: Path) -> None:
     assert expected_files <= {path.name for path in out_dir.iterdir()}
 
     summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["accepted_bar_count"] >= summary["actionable_signal_count"] >= 1
     assert summary["accepted_signal_count"] >= 1
     assert "risk_skip_count" in summary
     assert summary["daily_halt_event_count"] >= 1
@@ -438,10 +492,12 @@ def test_canonical_gold_symbol_is_preserved_in_reports(tmp_path: Path) -> None:
         gold_config=gold,
     )
 
+    accepted_bars = pd.read_csv(result.paths["accepted_bars_path"])
     accepted = pd.read_csv(result.paths["accepted_signals_path"])
     rejected = pd.read_csv(result.paths["rejected_signals_path"])
     summary = json.loads(result.paths["summary_path"].read_text(encoding="utf-8"))
 
+    assert "MGC" not in set(accepted_bars["instrument"])
     assert "GOLD" in set(rejected["instrument"])
     assert "MGC" not in set(rejected["instrument"])
     if not accepted.empty:
@@ -471,6 +527,7 @@ def test_per_instrument_rejection_report_and_diagnostics_are_written(tmp_path: P
     assert {"instrument", "rejection_reason", "count"} == set(by_instrument.columns)
     assert {"NQ", "YM", "GOLD"} <= set(by_instrument["instrument"])
     assert {"NQ", "YM"} <= set(diagnostics["instrument"])
+    assert {"accepted_bar_count", "actionable_signal_count"} <= set(diagnostics.columns)
     assert diagnostics.loc[diagnostics["instrument"] == "NQ", "top_rejection_reason"].notna().all()
     assert diagnostics.loc[diagnostics["instrument"] == "YM", "top_rejection_reason"].notna().all()
 
@@ -490,15 +547,71 @@ def test_replay_suppresses_identical_consecutive_gold_accepts(tmp_path: Path) ->
         gold_config=gold,
     )
 
+    accepted_bars = pd.read_csv(result.paths["accepted_bars_path"])
     accepted = pd.read_csv(result.paths["accepted_signals_path"])
     repeated = pd.read_csv(result.paths["repeated_accepted_signals_path"])
     repeated_by_instrument = pd.read_csv(result.paths["repeated_accepted_signals_by_instrument_path"])
     summary = json.loads(result.paths["summary_path"].read_text(encoding="utf-8"))
 
     assert not repeated.empty
+    assert not accepted_bars.empty
     assert set(accepted["instrument"]) == {"GOLD"}
+    assert set(accepted_bars["instrument"]) == {"GOLD"}
     assert repeated["instrument"].eq("GOLD").all()
     assert summary["repeated_accepted_signal_count"] == len(repeated.index)
-    assert len(accepted.index) < sum(record.outcome.value == "accepted_signal" for record in result.records)
+    assert summary["accepted_bar_count"] == len(accepted_bars.index)
+    assert summary["actionable_signal_count"] == len(accepted.index)
+    assert len(accepted.index) < len(accepted_bars.index)
+    assert accepted["actionable_signal_id"].nunique() == 1
     gold_repeat = repeated_by_instrument.loc[repeated_by_instrument["instrument"] == "GOLD"].iloc[0]
-    assert int(gold_repeat["repeated_accepted_signal_count"]) >= 1
+    assert int(gold_repeat["suppressed_accepted_bar_count"]) >= 1
+
+
+def test_new_setup_fingerprint_counts_as_new_actionable_signal(tmp_path: Path) -> None:
+    data = tmp_path / "gold_shift.csv"
+    out_dir = tmp_path / "out"
+    _write_gold_fingerprint_shift_csv(data)
+    nq, ym, gold = _configs()
+
+    result = run_corrected_validation_replay(
+        data_path=data,
+        out_dir=out_dir,
+        instruments_by_symbol=_instruments(),
+        nq_config=nq,
+        ym_config=ym,
+        gold_config=gold,
+    )
+
+    accepted = pd.read_csv(result.paths["accepted_signals_path"])
+    accepted_bars = pd.read_csv(result.paths["accepted_bars_path"])
+
+    assert len(accepted_bars.index) > len(accepted.index) >= 2
+    assert accepted["setup_fingerprint"].nunique() >= 2
+    assert accepted["actionable_signal_id"].nunique() >= 2
+
+
+def test_replay_preserves_actionable_signals_for_nq_ym_and_gold(tmp_path: Path) -> None:
+    data = tmp_path / "validation.csv"
+    out_dir = tmp_path / "out"
+    _write_validation_csv(data, gold_realized_pnl=0.0, include_gold_open_position=False)
+    nq, ym, gold = _configs()
+
+    result = run_corrected_validation_replay(
+        data_path=data,
+        out_dir=out_dir,
+        instruments_by_symbol=_instruments(),
+        nq_config=nq,
+        ym_config=ym,
+        gold_config=gold,
+    )
+
+    summary = json.loads(result.paths["summary_path"].read_text(encoding="utf-8"))
+    actionable = {row["instrument"]: row["actionable_signal_count"] for row in summary["signals_by_instrument"]}
+    accepted_bars = pd.read_csv(result.paths["accepted_bars_path"])
+    accepted = pd.read_csv(result.paths["accepted_signals_path"])
+
+    assert actionable["NQ"] >= 1
+    assert actionable["YM"] >= 1
+    assert actionable["GOLD"] >= 1
+    assert set(accepted_bars["instrument"]) <= {"NQ", "YM", "GOLD"}
+    assert set(accepted["instrument"]) <= {"NQ", "YM", "GOLD"}

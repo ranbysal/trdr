@@ -1,0 +1,4 @@
+instrument,accepted_signal_count,rejected_signal_count,repeated_accepted_signal_count,repeat_run_count,max_consecutive_repeat_count,top_rejection_reason,top_rejection_count,probable_zero_signal_cause
+GOLD,2411,9740,72,71,2,no_mean_reversion_or_structural_setup,8628,
+NQ,212,12995,2,2,1,order_block_alignment_failed,4842,
+YM,6063,6181,836,718,3,no_mean_reversion_or_ema_continuation_setup,4739,

@@ -1,0 +1,4 @@
+instrument,repeated_accepted_signal_count,repeat_run_count,max_consecutive_repeat_count
+GOLD,72,71,2
+NQ,2,2,1
+YM,836,718,3

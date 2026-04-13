@@ -33,6 +33,7 @@ from futures_bot.pipeline.corrected_orchestrator import (
 from futures_bot.risk.models import OpenPositionMtmSnapshot
 
 _REQUIRED_COLUMNS = {"timestamp_et", "symbol", "open", "high", "low", "close", "volume"}
+_ACTIONABLE_REARM_BARS_BY_INSTRUMENT = {"NQ": 1, "YM": 5, "GOLD": 5}
 
 
 class ReplayOutcome(str, Enum):
@@ -56,6 +57,7 @@ class ReplayValidationRecord:
     contracts: int | None
     state_metric_name: str | None
     state_metric_value: float | None
+    setup_fingerprint: str | None
     effective_anchor_ts: datetime | None
     current_session_date: str
     stage_events: tuple[StageEvent, ...]
@@ -70,18 +72,22 @@ class ReplayValidationResult:
 
 @dataclass(frozen=True, slots=True)
 class AcceptedSignalDiagnostics:
+    raw_accepted_records: tuple[ReplayValidationRecord, ...]
     unique_accepted_records: tuple[ReplayValidationRecord, ...]
+    accepted_bar_diagnostics: pd.DataFrame
     repeated_accepted_signals: pd.DataFrame
     repeated_accepted_signals_by_instrument: pd.DataFrame
 
 
 @dataclass(slots=True)
 class _AcceptedSignalRepeatState:
-    signature: tuple[object, ...]
-    last_ts: datetime
+    active_fingerprint: str
+    actionable_signal_id: int
+    current_session_date: str
+    effective_anchor_ts: str | None
     last_unique_ts: datetime
-    run_id: int
-    consecutive_repeat_count: int = 0
+    inactive_bar_count: int = 0
+    suppressed_repeat_count: int = 0
 
 
 def run_corrected_validation_replay(
@@ -167,6 +173,7 @@ def _run_corrected_validation_replay_rows(
                 output = orchestrator.evaluate_gold(request)
 
             session_state = output.session_state
+            effective_anchor_ts = effective_anchor_timestamp(session_state, ts=row.ts.to_pydatetime())
             records.append(
                 ReplayValidationRecord(
                     ts=row.ts.to_pydatetime(),
@@ -180,7 +187,15 @@ def _run_corrected_validation_replay_rows(
                     contracts=_contracts_for_output(output),
                     state_metric_name=_state_metric_name_for_output(output),
                     state_metric_value=_state_metric_value_for_output(output),
-                    effective_anchor_ts=effective_anchor_timestamp(session_state, ts=row.ts.to_pydatetime()),
+                    setup_fingerprint=_setup_fingerprint_for_output(
+                        replay_symbol=symbol,
+                        row=row,
+                        output=output,
+                        instrument=instrument,
+                        effective_anchor_ts=effective_anchor_ts,
+                        current_session_date=session_state.current_session.session_date.isoformat(),
+                    ),
+                    effective_anchor_ts=effective_anchor_ts,
                     current_session_date=session_state.current_session.session_date.isoformat(),
                     stage_events=output.stage_events,
                 )
@@ -204,26 +219,33 @@ def _run_corrected_validation_replay_rows(
 
     events_path = _write_events(out_dir=output_dir, records=records)
     accepted_signal_diagnostics = build_accepted_signal_diagnostics(records)
-    accepted_signals = build_accepted_signals(accepted_signal_diagnostics.unique_accepted_records)
+    accepted_bars = build_accepted_bars(accepted_signal_diagnostics.accepted_bar_diagnostics)
+    accepted_signals = build_accepted_signals(accepted_signal_diagnostics.accepted_bar_diagnostics)
     rejected_signals = build_rejected_signals(records)
+    accepted_bars_by_instrument = build_accepted_bars_by_instrument(accepted_signal_diagnostics.raw_accepted_records)
     signals_by_instrument = build_signals_by_instrument(accepted_signal_diagnostics.unique_accepted_records)
     rejection_reason_counts = build_rejections_by_reason(records)
     rejection_reason_counts_by_instrument = build_rejections_by_reason_by_instrument(records)
     daily_halt_events = build_daily_halt_events(records)
     daily_halt_occurrences = build_daily_halt_occurrences(records)
     signal_frequency_by_instrument = build_signal_frequency_by_instrument(
-        accepted_signal_diagnostics.unique_accepted_records,
-        replay_rows,
+        raw_accepted_records=accepted_signal_diagnostics.raw_accepted_records,
+        actionable_records=accepted_signal_diagnostics.unique_accepted_records,
+        replay_rows=replay_rows,
     )
     instrument_diagnostics = build_instrument_diagnostics(
         records=records,
+        raw_accepted_records=accepted_signal_diagnostics.raw_accepted_records,
         unique_accepted_records=accepted_signal_diagnostics.unique_accepted_records,
+        accepted_bars_by_instrument=accepted_bars_by_instrument,
         rejection_reason_counts_by_instrument=rejection_reason_counts_by_instrument,
         repeated_accepted_signals_by_instrument=accepted_signal_diagnostics.repeated_accepted_signals_by_instrument,
     )
     summary = build_validation_summary(
         records=records,
+        raw_accepted_records=accepted_signal_diagnostics.raw_accepted_records,
         unique_accepted_records=accepted_signal_diagnostics.unique_accepted_records,
+        accepted_bars_by_instrument=accepted_bars_by_instrument,
         signals_by_instrument=signals_by_instrument,
         rejection_reason_counts=rejection_reason_counts,
         rejection_reason_counts_by_instrument=rejection_reason_counts_by_instrument,
@@ -238,6 +260,7 @@ def _run_corrected_validation_replay_rows(
     paths.update(
         write_validation_reports(
             out_dir=output_dir,
+            accepted_bars=accepted_bars,
             accepted_signals=accepted_signals,
             rejected_signals=rejected_signals,
             rejection_reason_counts=rejection_reason_counts,
@@ -260,35 +283,38 @@ def _run_corrected_validation_replay_rows(
 def build_signals_by_instrument(records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...]) -> pd.DataFrame:
     accepted = [record for record in records if record.outcome is ReplayOutcome.ACCEPTED_SIGNAL]
     if not accepted:
-        return pd.DataFrame(columns=["instrument", "accepted_signal_count"])
+        return pd.DataFrame(columns=["instrument", "actionable_signal_count"])
     frame = pd.DataFrame({"instrument": [record.symbol for record in accepted]})
-    out = frame.value_counts().rename("accepted_signal_count").reset_index()
+    out = frame.value_counts().rename("actionable_signal_count").reset_index()
     return out.sort_values("instrument").reset_index(drop=True)
 
 
-def build_accepted_signals(records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...]) -> pd.DataFrame:
-    rows = [
-        {
-            "ts": record.ts.isoformat(),
-            "instrument": record.symbol,
-            "outcome": record.outcome.value,
-            "strategy": record.strategy,
-            "setup": record.setup,
-            "side": record.side,
-            "score": record.score,
-            "contracts": record.contracts,
-            "state_metric_name": record.state_metric_name,
-            "state_metric_value": record.state_metric_value,
-            "effective_anchor_ts": _isoformat_or_none(record.effective_anchor_ts),
-            "current_session_date": record.current_session_date,
-            "stage_events_json": _stage_events_json(record.stage_events),
-        }
-        for record in records
-        if record.outcome is ReplayOutcome.ACCEPTED_SIGNAL
-    ]
-    return pd.DataFrame(
-        rows,
-        columns=[
+def build_accepted_bars(records: pd.DataFrame) -> pd.DataFrame:
+    if records.empty:
+        return pd.DataFrame(
+            columns=[
+                "ts",
+                "instrument",
+                "outcome",
+                "strategy",
+                "setup",
+                "side",
+                "score",
+                "contracts",
+                "state_metric_name",
+                "state_metric_value",
+                "setup_fingerprint",
+                "effective_anchor_ts",
+                "current_session_date",
+                "actionable_signal_id",
+                "actionable_status",
+                "suppression_reason",
+                "stage_events_json",
+            ]
+        )
+    return records.loc[
+        :,
+        [
             "ts",
             "instrument",
             "outcome",
@@ -299,11 +325,33 @@ def build_accepted_signals(records: list[ReplayValidationRecord] | tuple[ReplayV
             "contracts",
             "state_metric_name",
             "state_metric_value",
+            "setup_fingerprint",
             "effective_anchor_ts",
             "current_session_date",
+            "actionable_signal_id",
+            "actionable_status",
+            "suppression_reason",
             "stage_events_json",
         ],
-    )
+    ].reset_index(drop=True)
+
+
+def build_accepted_signals(records: pd.DataFrame) -> pd.DataFrame:
+    accepted = build_accepted_bars(records)
+    if accepted.empty:
+        return accepted
+    return accepted.loc[accepted["actionable_status"] == "new_actionable_signal"].reset_index(drop=True)
+
+
+def build_accepted_bars_by_instrument(
+    records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...]
+) -> pd.DataFrame:
+    accepted = [record for record in records if record.outcome is ReplayOutcome.ACCEPTED_SIGNAL]
+    if not accepted:
+        return pd.DataFrame(columns=["instrument", "accepted_bar_count"])
+    frame = pd.DataFrame({"instrument": [record.symbol for record in accepted]})
+    out = frame.value_counts().rename("accepted_bar_count").reset_index()
+    return out.sort_values("instrument").reset_index(drop=True)
 
 
 def build_rejected_signals(records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...]) -> pd.DataFrame:
@@ -391,7 +439,8 @@ def build_daily_halt_occurrences(records: list[ReplayValidationRecord] | tuple[R
 
 
 def build_signal_frequency_by_instrument(
-    records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...],
+    raw_accepted_records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...],
+    actionable_records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...],
     replay_rows: pd.DataFrame,
 ) -> pd.DataFrame:
     active_days = (
@@ -402,70 +451,97 @@ def build_signal_frequency_by_instrument(
         .reset_index()
         .rename(columns={"symbol": "instrument"})
     )
-    signals = build_signals_by_instrument(records)
-    merged = active_days.merge(signals, how="left", on="instrument").fillna({"accepted_signal_count": 0})
-    merged["accepted_signal_count"] = merged["accepted_signal_count"].astype(int)
-    merged["accepted_signals_per_active_day"] = merged["accepted_signal_count"] / merged["active_days"]
+    raw_counts = build_accepted_bars_by_instrument(raw_accepted_records)
+    signals = build_signals_by_instrument(actionable_records)
+    merged = (
+        active_days.merge(raw_counts, how="left", on="instrument")
+        .merge(signals, how="left", on="instrument")
+        .fillna({"accepted_bar_count": 0, "actionable_signal_count": 0})
+    )
+    merged["accepted_bar_count"] = merged["accepted_bar_count"].astype(int)
+    merged["actionable_signal_count"] = merged["actionable_signal_count"].astype(int)
+    merged["accepted_bars_per_active_day"] = merged["accepted_bar_count"] / merged["active_days"]
+    merged["actionable_signals_per_active_day"] = merged["actionable_signal_count"] / merged["active_days"]
     return merged.sort_values("instrument").reset_index(drop=True)
 
 
 def build_accepted_signal_diagnostics(
     records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...]
 ) -> AcceptedSignalDiagnostics:
+    raw_accepted_records = tuple(record for record in records if record.outcome is ReplayOutcome.ACCEPTED_SIGNAL)
     unique_accepted_records: list[ReplayValidationRecord] = []
+    accepted_bar_rows: list[dict[str, object]] = []
     repeated_rows: list[dict[str, object]] = []
     states: dict[str, _AcceptedSignalRepeatState] = {}
-    next_run_id = 1
+    next_actionable_signal_id = 1
 
     for record in records:
         state = states.get(record.symbol)
+        if (
+            state is not None
+            and (
+                state.current_session_date != record.current_session_date
+                or state.effective_anchor_ts != _isoformat_or_none(record.effective_anchor_ts)
+            )
+        ):
+            state = None
+            states.pop(record.symbol, None)
         if record.outcome is not ReplayOutcome.ACCEPTED_SIGNAL:
             if state is not None:
-                states.pop(record.symbol, None)
+                state.inactive_bar_count += 1
             continue
 
-        signature = _accepted_signal_signature(record)
-        is_repeat = (
-            state is not None
-            and record.ts - state.last_ts == timedelta(minutes=1)
-            and signature == state.signature
+        fingerprint = record.setup_fingerprint
+        rearm_bars = _ACTIONABLE_REARM_BARS_BY_INSTRUMENT.get(record.symbol, 1)
+        is_new_actionable = (
+            state is None
+            or fingerprint != state.active_fingerprint
+            or state.inactive_bar_count >= rearm_bars
         )
-        if not is_repeat:
+        if is_new_actionable:
+            actionable_signal_id = next_actionable_signal_id
+            next_actionable_signal_id += 1
             unique_accepted_records.append(record)
             states[record.symbol] = _AcceptedSignalRepeatState(
-                signature=signature,
-                last_ts=record.ts,
+                active_fingerprint=fingerprint or "",
+                actionable_signal_id=actionable_signal_id,
+                current_session_date=record.current_session_date,
+                effective_anchor_ts=_isoformat_or_none(record.effective_anchor_ts),
                 last_unique_ts=record.ts,
-                run_id=next_run_id,
+                inactive_bar_count=0,
             )
-            next_run_id += 1
+            accepted_bar_rows.append(
+                _accepted_bar_row(
+                    record=record,
+                    actionable_signal_id=actionable_signal_id,
+                    actionable_status="new_actionable_signal",
+                    suppression_reason=None,
+                )
+            )
             continue
 
-        state.last_ts = record.ts
-        state.consecutive_repeat_count += 1
-        repeated_rows.append(
-            {
-                "ts": record.ts.isoformat(),
-                "instrument": record.symbol,
-                "strategy": record.strategy,
-                "setup": record.setup,
-                "side": record.side,
-                "score": record.score,
-                "contracts": record.contracts,
-                "state_metric_name": record.state_metric_name,
-                "state_metric_value": record.state_metric_value,
-                "previous_unique_signal_ts": state.last_unique_ts.isoformat(),
-                "repeat_run_id": state.run_id,
-                "consecutive_repeat_count": state.consecutive_repeat_count,
-                "repeat_reason": "same_strategy_setup_on_consecutive_bar_without_state_change",
-            }
+        state.inactive_bar_count = 0
+        state.suppressed_repeat_count += 1
+        suppression_reason = (
+            "setup_rearmed_after_gap_required"
+            if fingerprint == state.active_fingerprint and rearm_bars > 1
+            else "unchanged_setup_fingerprint"
         )
+        row = _accepted_bar_row(
+            record=record,
+            actionable_signal_id=state.actionable_signal_id,
+            actionable_status="suppressed_existing_setup",
+            suppression_reason=suppression_reason,
+        )
+        accepted_bar_rows.append(row)
+        repeated_rows.append(row)
 
-    repeated = pd.DataFrame(
-        repeated_rows,
+    accepted_bar_diagnostics = pd.DataFrame(
+        accepted_bar_rows,
         columns=[
             "ts",
             "instrument",
+            "outcome",
             "strategy",
             "setup",
             "side",
@@ -473,35 +549,60 @@ def build_accepted_signal_diagnostics(
             "contracts",
             "state_metric_name",
             "state_metric_value",
-            "previous_unique_signal_ts",
-            "repeat_run_id",
-            "consecutive_repeat_count",
-            "repeat_reason",
+            "setup_fingerprint",
+            "effective_anchor_ts",
+            "current_session_date",
+            "actionable_signal_id",
+            "actionable_status",
+            "suppression_reason",
+            "stage_events_json",
+        ],
+    )
+    repeated = pd.DataFrame(
+        repeated_rows,
+        columns=[
+            "ts",
+            "instrument",
+            "outcome",
+            "strategy",
+            "setup",
+            "side",
+            "score",
+            "contracts",
+            "state_metric_name",
+            "state_metric_value",
+            "setup_fingerprint",
+            "effective_anchor_ts",
+            "current_session_date",
+            "actionable_signal_id",
+            "actionable_status",
+            "suppression_reason",
+            "stage_events_json",
         ],
     )
     if repeated.empty:
         repeated_by_instrument = pd.DataFrame(
             columns=[
                 "instrument",
-                "repeated_accepted_signal_count",
-                "repeat_run_count",
-                "max_consecutive_repeat_count",
+                "suppressed_accepted_bar_count",
+                "suppressed_actionable_signal_count",
             ]
         )
     else:
         repeated_by_instrument = (
             repeated.groupby("instrument", dropna=False)
             .agg(
-                repeated_accepted_signal_count=("instrument", "size"),
-                repeat_run_count=("repeat_run_id", "nunique"),
-                max_consecutive_repeat_count=("consecutive_repeat_count", "max"),
+                suppressed_accepted_bar_count=("instrument", "size"),
+                suppressed_actionable_signal_count=("actionable_signal_id", "nunique"),
             )
             .reset_index()
             .sort_values("instrument")
             .reset_index(drop=True)
         )
     return AcceptedSignalDiagnostics(
+        raw_accepted_records=raw_accepted_records,
         unique_accepted_records=tuple(unique_accepted_records),
+        accepted_bar_diagnostics=accepted_bar_diagnostics,
         repeated_accepted_signals=repeated,
         repeated_accepted_signals_by_instrument=repeated_by_instrument,
     )
@@ -510,14 +611,17 @@ def build_accepted_signal_diagnostics(
 def build_instrument_diagnostics(
     *,
     records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...],
+    raw_accepted_records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...],
     unique_accepted_records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...],
+    accepted_bars_by_instrument: pd.DataFrame,
     rejection_reason_counts_by_instrument: pd.DataFrame,
     repeated_accepted_signals_by_instrument: pd.DataFrame,
 ) -> pd.DataFrame:
     instruments = sorted({record.symbol for record in records})
+    raw_accepted_counts = accepted_bars_by_instrument.set_index("instrument") if not accepted_bars_by_instrument.empty else pd.DataFrame(columns=["accepted_bar_count"])
     accepted_counts = (
         build_signals_by_instrument(unique_accepted_records)
-        .rename(columns={"accepted_signal_count": "accepted_signal_count"})
+        .rename(columns={"actionable_signal_count": "actionable_signal_count"})
         .set_index("instrument")
     )
     repeated_counts = (
@@ -525,9 +629,8 @@ def build_instrument_diagnostics(
         if not repeated_accepted_signals_by_instrument.empty
         else pd.DataFrame(
             columns=[
-                "repeated_accepted_signal_count",
-                "repeat_run_count",
-                "max_consecutive_repeat_count",
+                "suppressed_accepted_bar_count",
+                "suppressed_actionable_signal_count",
             ]
         )
     )
@@ -548,15 +651,15 @@ def build_instrument_diagnostics(
 
     rows: list[dict[str, object]] = []
     for instrument in instruments:
-        accepted_signal_count = int(accepted_counts.loc[instrument, "accepted_signal_count"]) if instrument in accepted_counts.index else 0
-        repeated_signal_count = (
-            int(repeated_counts.loc[instrument, "repeated_accepted_signal_count"])
+        accepted_bar_count = int(raw_accepted_counts.loc[instrument, "accepted_bar_count"]) if instrument in raw_accepted_counts.index else 0
+        actionable_signal_count = int(accepted_counts.loc[instrument, "actionable_signal_count"]) if instrument in accepted_counts.index else 0
+        suppressed_accepted_bar_count = (
+            int(repeated_counts.loc[instrument, "suppressed_accepted_bar_count"])
             if instrument in repeated_counts.index
             else 0
         )
-        repeat_run_count = int(repeated_counts.loc[instrument, "repeat_run_count"]) if instrument in repeated_counts.index else 0
-        max_repeat_count = (
-            int(repeated_counts.loc[instrument, "max_consecutive_repeat_count"])
+        suppressed_actionable_signal_count = (
+            int(repeated_counts.loc[instrument, "suppressed_actionable_signal_count"])
             if instrument in repeated_counts.index
             else 0
         )
@@ -564,15 +667,15 @@ def build_instrument_diagnostics(
         rows.append(
             {
                 "instrument": instrument,
-                "accepted_signal_count": accepted_signal_count,
+                "accepted_bar_count": accepted_bar_count,
+                "actionable_signal_count": actionable_signal_count,
                 "rejected_signal_count": rejected_counts.get(instrument, 0),
-                "repeated_accepted_signal_count": repeated_signal_count,
-                "repeat_run_count": repeat_run_count,
-                "max_consecutive_repeat_count": max_repeat_count,
+                "suppressed_accepted_bar_count": suppressed_accepted_bar_count,
+                "suppressed_actionable_signal_count": suppressed_actionable_signal_count,
                 "top_rejection_reason": top_reason,
                 "top_rejection_count": top_reason_count,
                 "probable_zero_signal_cause": _probable_zero_signal_cause(
-                    accepted_signal_count=accepted_signal_count,
+                    actionable_signal_count=actionable_signal_count,
                     top_rejection_reason=top_reason,
                 ),
             }
@@ -581,11 +684,11 @@ def build_instrument_diagnostics(
         rows,
         columns=[
             "instrument",
-            "accepted_signal_count",
+            "accepted_bar_count",
+            "actionable_signal_count",
             "rejected_signal_count",
-            "repeated_accepted_signal_count",
-            "repeat_run_count",
-            "max_consecutive_repeat_count",
+            "suppressed_accepted_bar_count",
+            "suppressed_actionable_signal_count",
             "top_rejection_reason",
             "top_rejection_count",
             "probable_zero_signal_cause",
@@ -596,7 +699,9 @@ def build_instrument_diagnostics(
 def build_validation_summary(
     *,
     records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...],
+    raw_accepted_records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...],
     unique_accepted_records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...],
+    accepted_bars_by_instrument: pd.DataFrame,
     signals_by_instrument: pd.DataFrame,
     rejection_reason_counts: pd.DataFrame,
     rejection_reason_counts_by_instrument: pd.DataFrame,
@@ -607,17 +712,22 @@ def build_validation_summary(
     repeated_accepted_signals_by_instrument: pd.DataFrame,
     instrument_diagnostics: pd.DataFrame,
 ) -> dict[str, Any]:
+    accepted_bar_count = len(raw_accepted_records)
     accepted_signal_count = len(unique_accepted_records)
     rejected_signal_count = int(sum(record.rejection_reason is not None for record in records))
     risk_skip_count = int(sum(record.outcome is ReplayOutcome.REJECTED_RISK for record in records))
     daily_halt_event_count = int(sum(record.outcome is ReplayOutcome.REJECTED_DAILY_HALT for record in records))
     return {
         "record_count": len(records),
+        "accepted_bar_count": accepted_bar_count,
+        "accepted_bars_by_instrument": accepted_bars_by_instrument.to_dict(orient="records"),
+        "actionable_signal_count": accepted_signal_count,
         "accepted_signal_count": accepted_signal_count,
         "rejected_signal_count": rejected_signal_count,
         "risk_skip_count": risk_skip_count,
         "daily_halt_event_count": daily_halt_event_count,
         "accepted_signals_by_instrument": signals_by_instrument.to_dict(orient="records"),
+        "actionable_signals_by_instrument": signals_by_instrument.to_dict(orient="records"),
         "signals_by_instrument": signals_by_instrument.to_dict(orient="records"),
         "rejection_reason_counts": rejection_reason_counts.to_dict(orient="records"),
         "rejections_by_reason": rejection_reason_counts.to_dict(orient="records"),
@@ -627,6 +737,7 @@ def build_validation_summary(
         "signal_frequency_by_instrument": signal_frequency_by_instrument.to_dict(orient="records"),
         "average_signal_frequency_by_instrument": signal_frequency_by_instrument.to_dict(orient="records"),
         "repeated_accepted_signal_count": int(len(repeated_accepted_signals.index)),
+        "suppressed_accepted_bar_count": int(len(repeated_accepted_signals.index)),
         "repeated_accepted_signals_by_instrument": repeated_accepted_signals_by_instrument.to_dict(orient="records"),
         "instrument_diagnostics": instrument_diagnostics.to_dict(orient="records"),
     }
@@ -914,18 +1025,100 @@ def _nq_structural_levels(row: Any) -> tuple[float, float, float, float]:
     return pullback_price, structure_break_price, order_block_low, order_block_high
 
 
-def _accepted_signal_signature(record: ReplayValidationRecord) -> tuple[object, ...]:
-    return (
-        record.strategy,
-        record.setup,
-        record.side,
-        record.current_session_date,
-        _isoformat_or_none(record.effective_anchor_ts),
-        record.contracts,
-        _round_or_none(record.score, digits=1),
-        record.state_metric_name,
-        _round_or_none(record.state_metric_value, digits=1),
+def _accepted_bar_row(
+    *,
+    record: ReplayValidationRecord,
+    actionable_signal_id: int,
+    actionable_status: str,
+    suppression_reason: str | None,
+) -> dict[str, object]:
+    return {
+        "ts": record.ts.isoformat(),
+        "instrument": record.symbol,
+        "outcome": record.outcome.value,
+        "strategy": record.strategy,
+        "setup": record.setup,
+        "side": record.side,
+        "score": record.score,
+        "contracts": record.contracts,
+        "state_metric_name": record.state_metric_name,
+        "state_metric_value": record.state_metric_value,
+        "setup_fingerprint": record.setup_fingerprint,
+        "effective_anchor_ts": _isoformat_or_none(record.effective_anchor_ts),
+        "current_session_date": record.current_session_date,
+        "actionable_signal_id": actionable_signal_id,
+        "actionable_status": actionable_status,
+        "suppression_reason": suppression_reason,
+        "stage_events_json": _stage_events_json(record.stage_events),
+    }
+
+
+def _setup_fingerprint_for_output(
+    *,
+    replay_symbol: str,
+    row: Any,
+    output: Any,
+    instrument: InstrumentMeta,
+    effective_anchor_ts: datetime | None,
+    current_session_date: str,
+) -> str | None:
+    if not isinstance(output, AcceptedSignalOutput):
+        return None
+    payload = {
+        "instrument": replay_symbol,
+        "strategy": output.signal.strategy.value,
+        "setup": output.candidate.setup.value,
+        "side": output.signal.side.value,
+        "session_date": current_session_date,
+        "anchor_ts": _isoformat_or_none(effective_anchor_ts),
+    }
+    payload.update(
+        _fingerprint_payload_for_output(
+            replay_symbol=replay_symbol,
+            row=row,
+            output=output,
+            instrument=instrument,
+        )
     )
+    return json.dumps(payload, sort_keys=True)
+
+
+def _fingerprint_payload_for_output(
+    *,
+    replay_symbol: str,
+    row: Any,
+    output: AcceptedSignalOutput,
+    instrument: InstrumentMeta,
+) -> dict[str, object]:
+    setup = output.candidate.setup.value
+    if replay_symbol == "NQ":
+        pullback_price, structure_break_price, order_block_low, order_block_high = _nq_structural_levels(row)
+        return {
+            "pullback_price": _quantize_price(pullback_price, tick_size=instrument.tick_size),
+            "structure_break_price": _quantize_price(structure_break_price, tick_size=instrument.tick_size),
+            "order_block_low": _quantize_price(order_block_low, tick_size=instrument.tick_size),
+            "order_block_high": _quantize_price(order_block_high, tick_size=instrument.tick_size),
+        }
+    if replay_symbol == "YM":
+        if setup == "primary_mean_reversion":
+            return {"mean_reversion_leg": "anchored_vwap_reversion"}
+        return {"continuation_state": setup}
+    if replay_symbol == "GOLD":
+        if setup == "primary_mean_reversion":
+            return {"mean_reversion_leg": "anchored_vwap_reversion"}
+        return {
+            "pullback_price": _quantize_price(_row_optional_float(row, "pullback_price"), tick_size=instrument.tick_size),
+            "structure_break_price": _quantize_price(
+                _row_optional_float(row, "structure_break_price"),
+                tick_size=instrument.tick_size,
+            ),
+            "order_block_low": _quantize_price(_row_optional_float(row, "order_block_low"), tick_size=instrument.tick_size),
+            "order_block_high": _quantize_price(
+                _row_optional_float(row, "order_block_high"),
+                tick_size=instrument.tick_size,
+            ),
+        }
+    return {"fallback_score_bucket": _round_or_none(output.signal.score, digits=1)}
 
 
 def _round_or_none(value: float | None, *, digits: int) -> float | None:
@@ -934,8 +1127,17 @@ def _round_or_none(value: float | None, *, digits: int) -> float | None:
     return round(float(value), digits)
 
 
-def _probable_zero_signal_cause(*, accepted_signal_count: int, top_rejection_reason: str | None) -> str | None:
-    if accepted_signal_count > 0 or top_rejection_reason is None:
+def _quantize_price(value: float | None, *, tick_size: float) -> float | None:
+    if value is None:
+        return None
+    if tick_size <= 0.0:
+        return round(float(value), 4)
+    ticks = round(float(value) / tick_size)
+    return round(ticks * tick_size, 6)
+
+
+def _probable_zero_signal_cause(*, actionable_signal_count: int, top_rejection_reason: str | None) -> str | None:
+    if actionable_signal_count > 0 or top_rejection_reason is None:
         return None
     if top_rejection_reason == "indicator_data_unavailable":
         return "indicator_availability"

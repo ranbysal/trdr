@@ -1,29 +1,37 @@
 {
-  "accepted_signal_count": 2483,
+  "accepted_signal_count": 8686,
   "accepted_signals_by_instrument": [
     {
-      "accepted_signal_count": 2483,
-      "symbol": "MGC"
+      "accepted_signal_count": 2411,
+      "instrument": "GOLD"
+    },
+    {
+      "accepted_signal_count": 212,
+      "instrument": "NQ"
+    },
+    {
+      "accepted_signal_count": 6063,
+      "instrument": "YM"
     }
   ],
   "average_signal_frequency_by_instrument": [
     {
-      "accepted_signal_count": 2483,
-      "accepted_signals_per_active_day": 225.72727272727272,
+      "accepted_signal_count": 2411,
+      "accepted_signals_per_active_day": 219.1818181818182,
       "active_days": 11,
-      "symbol": "MGC"
+      "instrument": "GOLD"
     },
     {
-      "accepted_signal_count": 0,
-      "accepted_signals_per_active_day": 0.0,
+      "accepted_signal_count": 212,
+      "accepted_signals_per_active_day": 17.666666666666668,
       "active_days": 12,
-      "symbol": "NQ"
+      "instrument": "NQ"
     },
     {
-      "accepted_signal_count": 0,
-      "accepted_signals_per_active_day": 0.0,
+      "accepted_signal_count": 6063,
+      "accepted_signals_per_active_day": 505.25,
       "active_days": 12,
-      "symbol": "YM"
+      "instrument": "YM"
     }
   ],
   "daily_halt_event_count": 0,
@@ -33,12 +41,51 @@
       "daily_halt_occurrences": 0
     }
   ],
+  "instrument_diagnostics": [
+    {
+      "accepted_signal_count": 2411,
+      "instrument": "GOLD",
+      "max_consecutive_repeat_count": 2,
+      "probable_zero_signal_cause": null,
+      "rejected_signal_count": 9740,
+      "repeat_run_count": 71,
+      "repeated_accepted_signal_count": 72,
+      "top_rejection_count": 8628,
+      "top_rejection_reason": "no_mean_reversion_or_structural_setup"
+    },
+    {
+      "accepted_signal_count": 212,
+      "instrument": "NQ",
+      "max_consecutive_repeat_count": 1,
+      "probable_zero_signal_cause": null,
+      "rejected_signal_count": 12995,
+      "repeat_run_count": 2,
+      "repeated_accepted_signal_count": 2,
+      "top_rejection_count": 4842,
+      "top_rejection_reason": "order_block_alignment_failed"
+    },
+    {
+      "accepted_signal_count": 6063,
+      "instrument": "YM",
+      "max_consecutive_repeat_count": 3,
+      "probable_zero_signal_cause": null,
+      "rejected_signal_count": 6181,
+      "repeat_run_count": 718,
+      "repeated_accepted_signal_count": 836,
+      "top_rejection_count": 4739,
+      "top_rejection_reason": "no_mean_reversion_or_ema_continuation_setup"
+    }
+  ],
   "record_count": 38512,
-  "rejected_signal_count": 36029,
+  "rejected_signal_count": 28916,
   "rejection_reason_counts": [
     {
-      "count": 7253,
+      "count": 375,
       "rejection_reason": "HARD_RISK_CAP_EXCEEDED"
+    },
+    {
+      "count": 33,
+      "rejection_reason": "INVALID_STOP_DISTANCE"
     },
     {
       "count": 3282,
@@ -57,14 +104,84 @@
       "rejection_reason": "no_mean_reversion_or_structural_setup"
     },
     {
-      "count": 8827,
+      "count": 4842,
       "rejection_reason": "order_block_alignment_failed"
+    },
+    {
+      "count": 3717,
+      "rejection_reason": "structure_continuation_failed"
+    }
+  ],
+  "rejection_reason_counts_by_instrument": [
+    {
+      "count": 12,
+      "instrument": "GOLD",
+      "rejection_reason": "HARD_RISK_CAP_EXCEEDED"
+    },
+    {
+      "count": 1100,
+      "instrument": "GOLD",
+      "rejection_reason": "indicator_data_unavailable"
+    },
+    {
+      "count": 8628,
+      "instrument": "GOLD",
+      "rejection_reason": "no_mean_reversion_or_structural_setup"
+    },
+    {
+      "count": 21,
+      "instrument": "NQ",
+      "rejection_reason": "HARD_RISK_CAP_EXCEEDED"
+    },
+    {
+      "count": 33,
+      "instrument": "NQ",
+      "rejection_reason": "INVALID_STOP_DISTANCE"
+    },
+    {
+      "count": 3282,
+      "instrument": "NQ",
+      "rejection_reason": "ema_alignment_failed"
+    },
+    {
+      "count": 1100,
+      "instrument": "NQ",
+      "rejection_reason": "indicator_data_unavailable"
+    },
+    {
+      "count": 4842,
+      "instrument": "NQ",
+      "rejection_reason": "order_block_alignment_failed"
+    },
+    {
+      "count": 3717,
+      "instrument": "NQ",
+      "rejection_reason": "structure_continuation_failed"
+    },
+    {
+      "count": 342,
+      "instrument": "YM",
+      "rejection_reason": "HARD_RISK_CAP_EXCEEDED"
+    },
+    {
+      "count": 1100,
+      "instrument": "YM",
+      "rejection_reason": "indicator_data_unavailable"
+    },
+    {
+      "count": 4739,
+      "instrument": "YM",
+      "rejection_reason": "no_mean_reversion_or_ema_continuation_setup"
     }
   ],
   "rejections_by_reason": [
     {
-      "count": 7253,
+      "count": 375,
       "rejection_reason": "HARD_RISK_CAP_EXCEEDED"
+    },
+    {
+      "count": 33,
+      "rejection_reason": "INVALID_STOP_DISTANCE"
     },
     {
       "count": 3282,
@@ -83,35 +200,68 @@
       "rejection_reason": "no_mean_reversion_or_structural_setup"
     },
     {
-      "count": 8827,
+      "count": 4842,
       "rejection_reason": "order_block_alignment_failed"
+    },
+    {
+      "count": 3717,
+      "rejection_reason": "structure_continuation_failed"
     }
   ],
-  "risk_skip_count": 7253,
+  "repeated_accepted_signal_count": 910,
+  "repeated_accepted_signals_by_instrument": [
+    {
+      "instrument": "GOLD",
+      "max_consecutive_repeat_count": 2,
+      "repeat_run_count": 71,
+      "repeated_accepted_signal_count": 72
+    },
+    {
+      "instrument": "NQ",
+      "max_consecutive_repeat_count": 1,
+      "repeat_run_count": 2,
+      "repeated_accepted_signal_count": 2
+    },
+    {
+      "instrument": "YM",
+      "max_consecutive_repeat_count": 3,
+      "repeat_run_count": 718,
+      "repeated_accepted_signal_count": 836
+    }
+  ],
+  "risk_skip_count": 408,
   "signal_frequency_by_instrument": [
     {
-      "accepted_signal_count": 2483,
-      "accepted_signals_per_active_day": 225.72727272727272,
+      "accepted_signal_count": 2411,
+      "accepted_signals_per_active_day": 219.1818181818182,
       "active_days": 11,
-      "symbol": "MGC"
+      "instrument": "GOLD"
     },
     {
-      "accepted_signal_count": 0,
-      "accepted_signals_per_active_day": 0.0,
+      "accepted_signal_count": 212,
+      "accepted_signals_per_active_day": 17.666666666666668,
       "active_days": 12,
-      "symbol": "NQ"
+      "instrument": "NQ"
     },
     {
-      "accepted_signal_count": 0,
-      "accepted_signals_per_active_day": 0.0,
+      "accepted_signal_count": 6063,
+      "accepted_signals_per_active_day": 505.25,
       "active_days": 12,
-      "symbol": "YM"
+      "instrument": "YM"
     }
   ],
   "signals_by_instrument": [
     {
-      "accepted_signal_count": 2483,
-      "symbol": "MGC"
+      "accepted_signal_count": 2411,
+      "instrument": "GOLD"
+    },
+    {
+      "accepted_signal_count": 212,
+      "instrument": "NQ"
+    },
+    {
+      "accepted_signal_count": 6063,
+      "instrument": "YM"
     }
   ]
 }
