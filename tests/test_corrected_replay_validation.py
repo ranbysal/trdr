@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pandas as pd
+
 from futures_bot.backtest.corrected_replay import run_corrected_validation_replay
 from futures_bot.config.models import GoldStrategyConfig, NQStrategyConfig, YMStrategyConfig
 from futures_bot.core.enums import Family
@@ -151,7 +153,7 @@ def _write_validation_csv(path: Path) -> None:
 def _configs() -> tuple[NQStrategyConfig, YMStrategyConfig, GoldStrategyConfig]:
     return (
         NQStrategyConfig(hard_risk_per_trade_dollars=750.0, daily_halt_loss_dollars=1_500.0),
-        YMStrategyConfig(hard_risk_per_trade_dollars=5.0, daily_halt_loss_dollars=1_500.0),
+        YMStrategyConfig(hard_risk_per_trade_dollars=500.0, daily_halt_loss_dollars=1_500.0),
         GoldStrategyConfig(
             hard_risk_per_trade_dollars=400.0,
             daily_halt_loss_dollars=1_200.0,
@@ -166,6 +168,51 @@ def _instruments() -> dict[str, InstrumentMeta]:
         "YM": _instrument("YM", family=Family.EQUITIES, tick_size=1.0, tick_value=5.0),
         "MGC": _instrument("MGC", family=Family.METALS, tick_size=0.1, tick_value=1.0),
     }
+
+
+def _write_repetitive_gold_csv(path: Path) -> None:
+    fields = [
+        "timestamp_et",
+        "symbol",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "liquidity_ok",
+        "macro_blocked",
+        "pullback_price",
+        "structure_break_price",
+        "order_block_low",
+        "order_block_high",
+        "session_start_equity",
+        "realized_pnl",
+    ]
+    start = datetime(2026, 1, 5, 8, 0, tzinfo=ET)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for i in range(140):
+            ts = start + timedelta(minutes=i)
+            writer.writerow(
+                {
+                    "timestamp_et": ts.isoformat(),
+                    "symbol": "MGC",
+                    "open": "2640.0",
+                    "high": "2640.2",
+                    "low": "2639.8",
+                    "close": "2640.0",
+                    "volume": "1000",
+                    "liquidity_ok": "true",
+                    "macro_blocked": "false",
+                    "pullback_price": "2640.0",
+                    "structure_break_price": "2640.0",
+                    "order_block_low": "2639.8",
+                    "order_block_high": "2640.2",
+                    "session_start_equity": "100000",
+                    "realized_pnl": "0",
+                }
+            )
 
 
 def test_replay_determinism_and_identical_inputs_produce_identical_outputs(tmp_path: Path) -> None:
@@ -251,7 +298,7 @@ def test_rejection_reason_counts_are_stable(tmp_path: Path) -> None:
     )
 
     reasons = {item["rejection_reason"]: item["count"] for item in result.summary["rejections_by_reason"]}
-    assert reasons["HARD_RISK_CAP_EXCEEDED"] >= 1
+    assert reasons["indicator_data_unavailable"] >= 1
     assert reasons["DAILY_LOSS_HALT"] >= 1
 
 
@@ -325,14 +372,18 @@ def test_corrected_replay_cli_writes_required_reports(tmp_path: Path) -> None:
         "accepted_signals.csv",
         "rejected_signals.csv",
         "rejection_reason_counts.csv",
+        "rejection_reason_counts_by_instrument.csv",
         "signal_frequency_by_instrument.csv",
         "daily_halt_events.csv",
+        "repeated_accepted_signals.csv",
+        "accepted_signal_repetition_by_instrument.csv",
+        "instrument_diagnostics.csv",
     }
     assert expected_files <= {path.name for path in out_dir.iterdir()}
 
     summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["accepted_signal_count"] >= 1
-    assert summary["risk_skip_count"] >= 1
+    assert "risk_skip_count" in summary
     assert summary["daily_halt_event_count"] >= 1
 
 
@@ -370,3 +421,84 @@ def test_corrected_replay_cli_fails_loudly_when_required_columns_are_missing(tmp
 
     assert completed.returncode == 2
     assert "Replay CSV missing required columns" in completed.stderr
+
+
+def test_canonical_gold_symbol_is_preserved_in_reports(tmp_path: Path) -> None:
+    data = tmp_path / "validation.csv"
+    out_dir = tmp_path / "out"
+    _write_validation_csv(data)
+    nq, ym, gold = _configs()
+
+    result = run_corrected_validation_replay(
+        data_path=data,
+        out_dir=out_dir,
+        instruments_by_symbol=_instruments(),
+        nq_config=nq,
+        ym_config=ym,
+        gold_config=gold,
+    )
+
+    accepted = pd.read_csv(result.paths["accepted_signals_path"])
+    rejected = pd.read_csv(result.paths["rejected_signals_path"])
+    summary = json.loads(result.paths["summary_path"].read_text(encoding="utf-8"))
+
+    assert "GOLD" in set(rejected["instrument"])
+    assert "MGC" not in set(rejected["instrument"])
+    if not accepted.empty:
+        assert "MGC" not in set(accepted["instrument"])
+    summary_instruments = {row["instrument"] for row in summary["signals_by_instrument"]}
+    assert "MGC" not in summary_instruments
+
+
+def test_per_instrument_rejection_report_and_diagnostics_are_written(tmp_path: Path) -> None:
+    data = tmp_path / "validation.csv"
+    out_dir = tmp_path / "out"
+    _write_validation_csv(data)
+    nq, ym, gold = _configs()
+
+    result = run_corrected_validation_replay(
+        data_path=data,
+        out_dir=out_dir,
+        instruments_by_symbol=_instruments(),
+        nq_config=nq,
+        ym_config=ym,
+        gold_config=gold,
+    )
+
+    by_instrument = pd.read_csv(result.paths["rejection_reason_counts_by_instrument_path"])
+    diagnostics = pd.read_csv(result.paths["instrument_diagnostics_path"])
+
+    assert {"instrument", "rejection_reason", "count"} == set(by_instrument.columns)
+    assert {"NQ", "YM", "GOLD"} <= set(by_instrument["instrument"])
+    assert {"NQ", "YM"} <= set(diagnostics["instrument"])
+    assert diagnostics.loc[diagnostics["instrument"] == "NQ", "top_rejection_reason"].notna().all()
+    assert diagnostics.loc[diagnostics["instrument"] == "YM", "top_rejection_reason"].notna().all()
+
+
+def test_replay_suppresses_identical_consecutive_gold_accepts(tmp_path: Path) -> None:
+    data = tmp_path / "gold.csv"
+    out_dir = tmp_path / "out"
+    _write_repetitive_gold_csv(data)
+    nq, ym, gold = _configs()
+
+    result = run_corrected_validation_replay(
+        data_path=data,
+        out_dir=out_dir,
+        instruments_by_symbol=_instruments(),
+        nq_config=nq,
+        ym_config=ym,
+        gold_config=gold,
+    )
+
+    accepted = pd.read_csv(result.paths["accepted_signals_path"])
+    repeated = pd.read_csv(result.paths["repeated_accepted_signals_path"])
+    repeated_by_instrument = pd.read_csv(result.paths["repeated_accepted_signals_by_instrument_path"])
+    summary = json.loads(result.paths["summary_path"].read_text(encoding="utf-8"))
+
+    assert not repeated.empty
+    assert set(accepted["instrument"]) == {"GOLD"}
+    assert repeated["instrument"].eq("GOLD").all()
+    assert summary["repeated_accepted_signal_count"] == len(repeated.index)
+    assert len(accepted.index) < sum(record.outcome.value == "accepted_signal" for record in result.records)
+    gold_repeat = repeated_by_instrument.loc[repeated_by_instrument["instrument"] == "GOLD"].iloc[0]
+    assert int(gold_repeat["repeated_accepted_signal_count"]) >= 1

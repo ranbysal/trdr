@@ -361,4 +361,4 @@ def test_corrected_replay_loader_accepts_prepared_gold_symbol(tmp_path: Path) ->
     )
 
     loaded = _load_replay_rows(prepared_path)
-    assert loaded["symbol"].tolist() == ["MGC"]
+    assert loaded["symbol"].tolist() == ["GOLD"]
