@@ -1,0 +1,18 @@
+{
+  "last_bar_by_symbol": {
+    "MGC": "2026-04-14T02:41:00-04:00",
+    "NQ": "2026-04-14T02:41:00-04:00",
+    "YM": "2026-04-14T02:41:00-04:00"
+  },
+  "last_heartbeat_timestamp": "2026-04-14T01:26:22.894413-04:00",
+  "last_signal_keys": {},
+  "open_positions": [],
+  "realized_pnl": 0.0,
+  "session_start_equity": 100000.0,
+  "signals_active": true,
+  "stale_alert_active_flags": {
+    "bar:MGC": false,
+    "bar:NQ": false,
+    "bar:YM": false
+  }
+}

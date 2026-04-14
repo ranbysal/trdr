@@ -71,7 +71,9 @@ class CorrectedV4LiveRunner:
         self._state_dir.mkdir(parents=True, exist_ok=True)
         self._notifier = notifier
         self._symbols = tuple(databento_symbols)
-        self._monitored_symbols = {_normalize_stream_symbol(symbol) for symbol in self._symbols}
+        self._monitored_symbols = {
+            _canonical_runtime_symbol(symbol, self._config.gold_symbol) for symbol in self._symbols
+        }
         self._events_log_path = self._out_dir / "live_events.ndjson"
         self._events_log = NdjsonWriter(self._events_log_path)
         self._state_store = JsonStateStore(self._state_dir / "corrected_v4_live_state.json")
@@ -84,13 +86,9 @@ class CorrectedV4LiveRunner:
         self._stale_monitor = StaleDataMonitor(
             bars_timeout_s=config.bars_stale_after_s,
             last_bar_by_symbol=self._parse_last_bars(restored.get("last_bar_by_symbol", {})),
-            stale_flags={str(k): bool(v) for k, v in dict(restored.get("stale_alert_active_flags", {})).items()},
+            stale_flags=self._parse_stale_flags(restored.get("stale_alert_active_flags", {})),
         )
-        self._last_signal_keys = {
-            str(symbol): str(signal_key)
-            for symbol, signal_key in dict(restored.get("last_signal_keys", {})).items()
-            if str(signal_key)
-        }
+        self._last_signal_keys = self._parse_last_signal_keys(restored.get("last_signal_keys", {}))
         self._histories: dict[str, SymbolHistory] = {}
         self._session_start_equity = float(restored.get("session_start_equity", config.starting_equity))
         self._realized_pnl = float(restored.get("realized_pnl", 0.0))
@@ -171,28 +169,28 @@ class CorrectedV4LiveRunner:
         if message.type == "event":
             self._handle_event(message)
             return
+        canonical_symbol = _canonical_runtime_symbol(message.symbol, self._config.gold_symbol)
         if message.type == "quote_1s":
             self._feed_connected = True
-            for event in self._stale_monitor.mark_quote(message.symbol, message.timestamp_et):
+            for event in self._stale_monitor.mark_quote(canonical_symbol, message.timestamp_et):
                 self._handle_stale_event(event)
             return
         if message.type != "bar_1m":
             return
 
         self._feed_connected = True
-        for event in self._stale_monitor.mark_bar(message.symbol, message.timestamp_et):
+        for event in self._stale_monitor.mark_bar(canonical_symbol, message.timestamp_et):
             self._handle_stale_event(event)
         self._write_event(
             event="BAR_RECEIVED",
             timestamp_et=message.timestamp_et,
-            symbol=message.symbol,
+            symbol=canonical_symbol,
             strategy="runtime",
             reason_code=None,
         )
 
-        stream_symbol = _canonical_stream_symbol(message.symbol)
         instrument = _resolve_live_instrument(
-            stream_symbol=stream_symbol,
+            symbol=canonical_symbol,
             instruments_by_symbol=self._instruments_by_symbol,
             gold_symbol=self._config.gold_symbol,
         )
@@ -204,8 +202,8 @@ class CorrectedV4LiveRunner:
         payload = message.payload
         bar_ts = message.timestamp_et.astimezone(ET)
         history = self._histories.setdefault(
-            stream_symbol,
-            SymbolHistory(last_signal_key=self._last_signal_keys.get(stream_symbol)),
+            canonical_symbol,
+            SymbolHistory(last_signal_key=self._last_signal_keys.get(canonical_symbol)),
         )
         _upsert_bar(
             history.bars_1m,
@@ -220,7 +218,8 @@ class CorrectedV4LiveRunner:
             max_keep=20_000,
         )
         request = _build_live_request(
-            stream_symbol=stream_symbol,
+            symbol=canonical_symbol,
+            gold_symbol=self._config.gold_symbol,
             bars_1m=pd.DataFrame(history.bars_1m),
             instrument=instrument,
             session_start_equity=self._session_start_equity,
@@ -294,7 +293,7 @@ class CorrectedV4LiveRunner:
             reason_code=signal.side.value,
         )
         history.last_signal_key = signal_key
-        self._last_signal_keys[_stream_symbol_for_instrument(signal.symbol, self._config.gold_symbol)] = signal_key
+        self._last_signal_keys[_canonical_runtime_symbol(signal.symbol, self._config.gold_symbol)] = signal_key
         logger.info(
             "Corrected V4 signal alert delivered=%s instrument=%s strategy=%s setup=%s",
             delivery.delivered,
@@ -323,7 +322,7 @@ class CorrectedV4LiveRunner:
         self._write_event(
             event="feed_event",
             timestamp_et=message.timestamp_et,
-            symbol=message.symbol,
+            symbol="*" if message.symbol == "*" else _canonical_runtime_symbol(message.symbol, self._config.gold_symbol),
             strategy="runtime",
             reason_code=code,
             detail=str(detail) if detail is not None else None,
@@ -519,8 +518,7 @@ class CorrectedV4LiveRunner:
             "point_value": position.point_value,
         }
 
-    @staticmethod
-    def _parse_open_positions(payload: Any) -> dict[str, OpenPositionMtmSnapshot]:
+    def _parse_open_positions(self, payload: Any) -> dict[str, OpenPositionMtmSnapshot]:
         if not isinstance(payload, list):
             return {}
         positions: dict[str, OpenPositionMtmSnapshot] = {}
@@ -534,7 +532,7 @@ class CorrectedV4LiveRunner:
                 ts = datetime.fromisoformat(raw_ts)
             except ValueError:
                 continue
-            symbol = str(item.get("symbol", "")).strip()
+            symbol = _canonical_runtime_symbol(str(item.get("symbol", "")).strip(), self._config.gold_symbol)
             if not symbol:
                 continue
             positions[symbol] = OpenPositionMtmSnapshot(
@@ -556,8 +554,7 @@ class CorrectedV4LiveRunner:
         except ValueError:
             return None
 
-    @staticmethod
-    def _parse_last_bars(payload: Any) -> dict[str, datetime]:
+    def _parse_last_bars(self, payload: Any) -> dict[str, datetime]:
         if not isinstance(payload, dict):
             return {}
         parsed: dict[str, datetime] = {}
@@ -565,9 +562,39 @@ class CorrectedV4LiveRunner:
             if not isinstance(raw_ts, str):
                 continue
             try:
-                parsed[str(symbol)] = datetime.fromisoformat(raw_ts)
+                timestamp = datetime.fromisoformat(raw_ts)
             except ValueError:
                 continue
+            canonical_symbol = _canonical_runtime_symbol(str(symbol), self._config.gold_symbol)
+            previous = parsed.get(canonical_symbol)
+            if previous is None or timestamp > previous:
+                parsed[canonical_symbol] = timestamp
+        return parsed
+
+    def _parse_stale_flags(self, payload: Any) -> dict[str, bool]:
+        if not isinstance(payload, dict):
+            return {}
+        parsed: dict[str, bool] = {}
+        for key, value in payload.items():
+            raw_key = str(key)
+            stream, sep, symbol = raw_key.partition(":")
+            if not sep:
+                parsed[raw_key] = bool(value)
+                continue
+            canonical_key = f"{stream}:{_canonical_runtime_symbol(symbol, self._config.gold_symbol)}"
+            parsed[canonical_key] = bool(value) or parsed.get(canonical_key, False)
+        return parsed
+
+    def _parse_last_signal_keys(self, payload: Any) -> dict[str, str]:
+        if not isinstance(payload, dict):
+            return {}
+        parsed: dict[str, str] = {}
+        for symbol, signal_key in payload.items():
+            signal_key_text = str(signal_key)
+            if not signal_key_text:
+                continue
+            canonical_symbol = _canonical_runtime_symbol(str(symbol), self._config.gold_symbol)
+            parsed[canonical_symbol] = signal_key_text
         return parsed
 
     @staticmethod
@@ -609,7 +636,8 @@ async def run_live_signals(
 
 def _build_live_request(
     *,
-    stream_symbol: str,
+    symbol: str,
+    gold_symbol: str,
     bars_1m: pd.DataFrame,
     instrument: InstrumentMeta,
     session_start_equity: float,
@@ -633,7 +661,7 @@ def _build_live_request(
         "fvg_present": False,
         "intermarket_confirmed": None,
     }
-    if stream_symbol == "NQ":
+    if symbol == "NQ":
         return NQEvaluationRequest(
             **base_kwargs,
             pullback_price=(candle_low + candle_high) / 2.0,
@@ -641,9 +669,9 @@ def _build_live_request(
             order_block_low=candle_low,
             order_block_high=candle_high,
         )
-    if stream_symbol == "YM":
+    if symbol == "YM":
         return YMEvaluationRequest(**base_kwargs)
-    if stream_symbol == "GOLD":
+    if symbol == gold_symbol.upper():
         return GoldEvaluationRequest(
             **base_kwargs,
             pullback_price=(candle_low + candle_high) / 2.0,
@@ -654,37 +682,31 @@ def _build_live_request(
     return None
 
 
-def _canonical_stream_symbol(symbol: str) -> str:
+def _canonical_runtime_symbol(symbol: str, gold_symbol: str) -> str:
     normalized = _normalize_stream_symbol(symbol)
     if normalized.startswith("NQ"):
         return "NQ"
     if normalized.startswith("YM"):
         return "YM"
-    if normalized.startswith(("GC", "MGC", "GOLD")):
-        return "GOLD"
-    return normalized
-
-
-def _stream_symbol_for_instrument(symbol: str, gold_symbol: str) -> str:
-    normalized = str(symbol).strip().upper()
-    if normalized == gold_symbol.upper():
-        return "GOLD"
+    if _is_gold_symbol(normalized):
+        return gold_symbol.upper()
     return normalized
 
 
 def _resolve_live_instrument(
     *,
-    stream_symbol: str,
+    symbol: str,
     instruments_by_symbol: dict[str, InstrumentMeta],
     gold_symbol: str,
 ) -> InstrumentMeta | None:
-    if stream_symbol == "GOLD":
+    canonical_symbol = _canonical_runtime_symbol(symbol, gold_symbol)
+    if canonical_symbol == gold_symbol.upper():
         for candidate in (gold_symbol, "MGC", "GC"):
             instrument = instruments_by_symbol.get(candidate)
             if instrument is not None:
                 return instrument
         return None
-    return instruments_by_symbol.get(stream_symbol)
+    return instruments_by_symbol.get(canonical_symbol)
 
 
 def _normalize_stream_symbol(symbol: str) -> str:
@@ -692,6 +714,11 @@ def _normalize_stream_symbol(symbol: str) -> str:
     if "." in raw:
         raw = raw.split(".", 1)[0]
     return raw
+
+
+def _is_gold_symbol(symbol: str) -> bool:
+    normalized = _normalize_stream_symbol(symbol)
+    return normalized.startswith(("GC", "MGC", "GOLD"))
 
 
 def _upsert_bar(bars: list[dict[str, object]], bar: dict[str, object], *, max_keep: int) -> None:
