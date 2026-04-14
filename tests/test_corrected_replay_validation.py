@@ -266,6 +266,91 @@ def _write_gold_fingerprint_shift_csv(path: Path) -> None:
             )
 
 
+def _write_gold_primary_rearm_csv(path: Path) -> None:
+    fields = [
+        "timestamp_et",
+        "symbol",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "liquidity_ok",
+        "macro_blocked",
+        "session_start_equity",
+        "realized_pnl",
+    ]
+    start = datetime(2026, 1, 5, 8, 0, tzinfo=ET)
+    prices = ([2640.0] * 100) + ([2648.0] * 10) + ([2640.0] * 5) + ([2641.0] * 5) + ([2638.0] * 5)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for i, close_price in enumerate(prices):
+            ts = start + timedelta(minutes=i)
+            writer.writerow(
+                {
+                    "timestamp_et": ts.isoformat(),
+                    "symbol": "MGC",
+                    "open": f"{close_price - 0.1:.2f}",
+                    "high": f"{close_price + 0.2:.2f}",
+                    "low": f"{close_price - 0.2:.2f}",
+                    "close": f"{close_price:.2f}",
+                    "volume": "1000",
+                    "liquidity_ok": "true",
+                    "macro_blocked": "false",
+                    "session_start_equity": "100000",
+                    "realized_pnl": "0",
+                }
+            )
+
+
+def _write_ym_secondary_rearm_csv(path: Path) -> None:
+    fields = [
+        "timestamp_et",
+        "symbol",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "liquidity_ok",
+        "macro_blocked",
+        "session_start_equity",
+        "realized_pnl",
+    ]
+    start = datetime(2026, 1, 5, 9, 30, tzinfo=ET)
+    prices = [42180.0 + 0.5 * i for i in range(125)]
+    prices.extend([prices[-1] + 0.5, prices[-1] + 1.0, prices[-1] + 1.5])
+    current_price = prices[-1]
+    for _ in range(6):
+        current_price -= 2.0
+        prices.append(current_price)
+    for _ in range(6):
+        current_price += 2.0
+        prices.append(current_price)
+
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for i, close_price in enumerate(prices):
+            ts = start + timedelta(minutes=i)
+            writer.writerow(
+                {
+                    "timestamp_et": ts.isoformat(),
+                    "symbol": "YM",
+                    "open": f"{close_price - 0.2:.2f}",
+                    "high": f"{close_price + 0.5:.2f}",
+                    "low": f"{close_price - 0.5:.2f}",
+                    "close": f"{close_price:.2f}",
+                    "volume": "1000",
+                    "liquidity_ok": "true",
+                    "macro_blocked": "false",
+                    "session_start_equity": "100000",
+                    "realized_pnl": "0",
+                }
+            )
+
+
 def test_replay_determinism_and_identical_inputs_produce_identical_outputs(tmp_path: Path) -> None:
     data = tmp_path / "validation.csv"
     out_a = tmp_path / "out_a"
@@ -437,6 +522,7 @@ def test_corrected_replay_cli_writes_required_reports(tmp_path: Path) -> None:
         "daily_halt_events.csv",
         "repeated_accepted_signals.csv",
         "accepted_signal_repetition_by_instrument.csv",
+        "setup_rearm_diagnostics.csv",
         "instrument_diagnostics.csv",
     }
     assert expected_files <= {path.name for path in out_dir.iterdir()}
@@ -694,6 +780,94 @@ def test_new_setup_fingerprint_counts_as_new_actionable_signal(tmp_path: Path) -
     assert accepted["actionable_signal_id"].nunique() >= 2
 
 
+def test_gold_primary_mean_reversion_requires_real_reset_before_rearm(tmp_path: Path) -> None:
+    data = tmp_path / "gold_primary_rearm.csv"
+    out_dir = tmp_path / "out"
+    _write_gold_primary_rearm_csv(data)
+    nq, ym, gold = _configs()
+
+    result = run_corrected_validation_replay(
+        data_path=data,
+        out_dir=out_dir,
+        instruments_by_symbol=_instruments(),
+        nq_config=nq,
+        ym_config=ym,
+        gold_config=gold,
+    )
+
+    accepted = pd.read_csv(result.paths["accepted_signals_path"])
+    rejected = pd.read_csv(result.paths["rejected_signals_path"])
+    rearm_diagnostics = pd.read_csv(result.paths["setup_rearm_diagnostics_path"])
+
+    gold_accepts = accepted.loc[
+        (accepted["instrument"] == "GOLD") & (accepted["setup"] == "primary_mean_reversion")
+    ].reset_index(drop=True)
+    gold_rearm_blocks = rejected.loc[
+        (rejected["instrument"] == "GOLD")
+        & (rejected["setup"] == "primary_mean_reversion")
+        & (rejected["rejection_reason"] == "primary_mean_reversion_rearm_blocked")
+    ].reset_index(drop=True)
+
+    assert len(gold_accepts.index) == 2
+    assert gold_accepts["side"].eq("buy").all()
+    assert gold_accepts["actionable_signal_id"].nunique() == 2
+    assert gold_accepts["reset_reason"].isna().sum() == 1
+    assert gold_accepts["reset_reason"].dropna().tolist() == ["anchor_cross_then_restretched"]
+    assert len(gold_rearm_blocks.index) >= 1
+
+    diag = rearm_diagnostics.loc[
+        (rearm_diagnostics["instrument"] == "GOLD")
+        & (rearm_diagnostics["setup"] == "primary_mean_reversion")
+    ].iloc[0]
+    assert int(diag["rearm_blocked_count"]) == len(gold_rearm_blocks.index)
+    assert int(diag["accepted_rearmed_count"]) == 1
+    assert "anchor_cross_then_restretched" in str(diag["accepted_reset_reasons_json"])
+
+
+def test_ym_secondary_continuation_requires_real_reset_before_rearm(tmp_path: Path) -> None:
+    data = tmp_path / "ym_secondary_rearm.csv"
+    out_dir = tmp_path / "out"
+    _write_ym_secondary_rearm_csv(data)
+    nq, ym, gold = _configs()
+
+    result = run_corrected_validation_replay(
+        data_path=data,
+        out_dir=out_dir,
+        instruments_by_symbol=_instruments(),
+        nq_config=nq,
+        ym_config=ym,
+        gold_config=gold,
+    )
+
+    accepted = pd.read_csv(result.paths["accepted_signals_path"])
+    rejected = pd.read_csv(result.paths["rejected_signals_path"])
+    rearm_diagnostics = pd.read_csv(result.paths["setup_rearm_diagnostics_path"])
+
+    ym_accepts = accepted.loc[
+        (accepted["instrument"] == "YM") & (accepted["setup"] == "secondary_ema_continuation")
+    ].reset_index(drop=True)
+    ym_rearm_blocks = rejected.loc[
+        (rejected["instrument"] == "YM")
+        & (rejected["setup"] == "secondary_ema_continuation")
+        & (rejected["rejection_reason"] == "secondary_ema_continuation_rearm_blocked")
+    ].reset_index(drop=True)
+
+    assert len(ym_accepts.index) == 2
+    assert ym_accepts["side"].eq("buy").all()
+    assert ym_accepts["actionable_signal_id"].nunique() == 2
+    assert ym_accepts["reset_reason"].isna().sum() == 1
+    assert ym_accepts["reset_reason"].dropna().tolist() == ["material_pullback_then_requalified"]
+    assert len(ym_rearm_blocks.index) >= 1
+
+    diag = rearm_diagnostics.loc[
+        (rearm_diagnostics["instrument"] == "YM")
+        & (rearm_diagnostics["setup"] == "secondary_ema_continuation")
+    ].iloc[0]
+    assert int(diag["rearm_blocked_count"]) == len(ym_rearm_blocks.index)
+    assert int(diag["accepted_rearmed_count"]) == 1
+    assert "material_pullback_then_requalified" in str(diag["accepted_reset_reasons_json"])
+
+
 def test_replay_preserves_actionable_signals_for_nq_ym_and_gold(tmp_path: Path) -> None:
     data = tmp_path / "validation.csv"
     out_dir = tmp_path / "out"
@@ -719,3 +893,6 @@ def test_replay_preserves_actionable_signals_for_nq_ym_and_gold(tmp_path: Path) 
     assert actionable["GOLD"] >= 1
     assert set(accepted_bars["instrument"]) <= {"NQ", "YM", "GOLD"}
     assert set(accepted["instrument"]) <= {"NQ", "YM", "GOLD"}
+    assert (
+        accepted.loc[accepted["instrument"] == "NQ", "setup"].eq("structural_continuation").any()
+    )

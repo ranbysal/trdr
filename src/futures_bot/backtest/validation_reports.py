@@ -28,6 +28,7 @@ def write_validation_reports(
     daily_halt_events: pd.DataFrame,
     repeated_accepted_signals: pd.DataFrame,
     repeated_accepted_signals_by_instrument: pd.DataFrame,
+    setup_rearm_diagnostics: pd.DataFrame,
     instrument_diagnostics: pd.DataFrame,
     summary: dict[str, Any],
 ) -> dict[str, Path]:
@@ -50,6 +51,7 @@ def write_validation_reports(
     daily_halt_events_path = output_dir / "daily_halt_events.csv"
     repeated_accepted_signals_path = output_dir / "repeated_accepted_signals.csv"
     repeated_accepted_signals_by_instrument_path = output_dir / "accepted_signal_repetition_by_instrument.csv"
+    setup_rearm_diagnostics_path = output_dir / "setup_rearm_diagnostics.csv"
     instrument_diagnostics_path = output_dir / "instrument_diagnostics.csv"
     summary_path = output_dir / "summary.json"
 
@@ -69,6 +71,7 @@ def write_validation_reports(
     daily_halt_events.to_csv(daily_halt_events_path, index=False)
     repeated_accepted_signals.to_csv(repeated_accepted_signals_path, index=False)
     repeated_accepted_signals_by_instrument.to_csv(repeated_accepted_signals_by_instrument_path, index=False)
+    setup_rearm_diagnostics.to_csv(setup_rearm_diagnostics_path, index=False)
     instrument_diagnostics.to_csv(instrument_diagnostics_path, index=False)
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True, default=str), encoding="utf-8")
 
@@ -89,6 +92,7 @@ def write_validation_reports(
         "daily_halt_events_path": daily_halt_events_path,
         "repeated_accepted_signals_path": repeated_accepted_signals_path,
         "repeated_accepted_signals_by_instrument_path": repeated_accepted_signals_by_instrument_path,
+        "setup_rearm_diagnostics_path": setup_rearm_diagnostics_path,
         "instrument_diagnostics_path": instrument_diagnostics_path,
         "summary_path": summary_path,
     }

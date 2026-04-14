@@ -16,13 +16,14 @@ import pandas as pd
 from futures_bot.backtest.validation_reports import write_validation_reports
 from futures_bot.config.models import GoldStrategyConfig, NQStrategyConfig, YMStrategyConfig
 from futures_bot.core.enums import Family
-from futures_bot.core.types import InstrumentMeta
+from futures_bot.core.types import InstrumentMeta, SignalCandidate
 from futures_bot.data.session_windows import is_equities_rth, is_metals_strategy_window
 from futures_bot.features import effective_anchor_timestamp
 from futures_bot.pipeline.corrected_orchestrator import (
     AcceptedSignalOutput,
     CorrectedSignalOrchestrator,
     DailyHaltRejectedSignalOutput,
+    FreshnessRejectedSignalOutput,
     GoldEvaluationRequest,
     LiquidityNewsRejectedSignalOutput,
     NQEvaluationRequest,
@@ -32,6 +33,9 @@ from futures_bot.pipeline.corrected_orchestrator import (
     YMEvaluationRequest,
 )
 from futures_bot.risk.models import OpenPositionMtmSnapshot
+from futures_bot.strategies.gold_models import GoldSignalResult
+from futures_bot.strategies.nq_models import NQSignalResult
+from futures_bot.strategies.ym_models import YMSignalResult
 
 _REQUIRED_COLUMNS = {"timestamp_et", "symbol", "open", "high", "low", "close", "volume"}
 _ACTIONABLE_REARM_BARS_BY_INSTRUMENT = {"NQ": 1, "YM": 5, "GOLD": 5}
@@ -59,6 +63,7 @@ class ReplayValidationRecord:
     state_metric_name: str | None
     state_metric_value: float | None
     setup_fingerprint: str | None
+    reset_reason: str | None
     effective_anchor_ts: datetime | None
     current_session_date: str
     stage_events: tuple[StageEvent, ...]
@@ -196,6 +201,7 @@ def _run_corrected_validation_replay_rows(
                         effective_anchor_ts=effective_anchor_ts,
                         current_session_date=session_state.current_session.session_date.isoformat(),
                     ),
+                    reset_reason=_reset_reason_for_output(output),
                     effective_anchor_ts=effective_anchor_ts,
                     current_session_date=session_state.current_session.session_date.isoformat(),
                     stage_events=output.stage_events,
@@ -247,6 +253,7 @@ def _run_corrected_validation_replay_rows(
         actionable_records=accepted_signal_diagnostics.unique_accepted_records,
         replay_rows=replay_rows,
     )
+    setup_rearm_diagnostics = build_setup_rearm_diagnostics(records)
     instrument_diagnostics = build_instrument_diagnostics(
         records=records,
         raw_accepted_records=accepted_signal_diagnostics.raw_accepted_records,
@@ -268,6 +275,7 @@ def _run_corrected_validation_replay_rows(
         signal_frequency_by_instrument=signal_frequency_by_instrument,
         repeated_accepted_signals=accepted_signal_diagnostics.repeated_accepted_signals,
         repeated_accepted_signals_by_instrument=accepted_signal_diagnostics.repeated_accepted_signals_by_instrument,
+        setup_rearm_diagnostics=setup_rearm_diagnostics,
         instrument_diagnostics=instrument_diagnostics,
     )
     paths = {"events_path": events_path}
@@ -290,6 +298,7 @@ def _run_corrected_validation_replay_rows(
             daily_halt_events=daily_halt_events,
             repeated_accepted_signals=accepted_signal_diagnostics.repeated_accepted_signals,
             repeated_accepted_signals_by_instrument=accepted_signal_diagnostics.repeated_accepted_signals_by_instrument,
+            setup_rearm_diagnostics=setup_rearm_diagnostics,
             instrument_diagnostics=instrument_diagnostics,
             summary=summary,
         )
@@ -325,6 +334,7 @@ def build_accepted_bars(records: pd.DataFrame) -> pd.DataFrame:
                 "state_metric_name",
                 "state_metric_value",
                 "setup_fingerprint",
+                "reset_reason",
                 "effective_anchor_ts",
                 "current_session_date",
                 "actionable_signal_id",
@@ -347,6 +357,7 @@ def build_accepted_bars(records: pd.DataFrame) -> pd.DataFrame:
             "state_metric_name",
             "state_metric_value",
             "setup_fingerprint",
+            "reset_reason",
             "effective_anchor_ts",
             "current_session_date",
             "actionable_signal_id",
@@ -565,6 +576,9 @@ def build_rejected_signals(records: list[ReplayValidationRecord] | tuple[ReplayV
             "instrument": record.symbol,
             "outcome": record.outcome.value,
             "rejection_reason": record.rejection_reason,
+            "strategy": record.strategy,
+            "setup": record.setup,
+            "side": record.side,
             "effective_anchor_ts": _isoformat_or_none(record.effective_anchor_ts),
             "current_session_date": record.current_session_date,
             "stage_events_json": _stage_events_json(record.stage_events),
@@ -579,6 +593,9 @@ def build_rejected_signals(records: list[ReplayValidationRecord] | tuple[ReplayV
             "instrument",
             "outcome",
             "rejection_reason",
+            "strategy",
+            "setup",
+            "side",
             "effective_anchor_ts",
             "current_session_date",
             "stage_events_json",
@@ -701,6 +718,7 @@ def build_accepted_signal_diagnostics(
             state is None
             or fingerprint != state.active_fingerprint
             or state.inactive_bar_count >= rearm_bars
+            or record.reset_reason is not None
         )
         if is_new_actionable:
             actionable_signal_id = next_actionable_signal_id
@@ -754,6 +772,7 @@ def build_accepted_signal_diagnostics(
             "state_metric_name",
             "state_metric_value",
             "setup_fingerprint",
+            "reset_reason",
             "effective_anchor_ts",
             "current_session_date",
             "actionable_signal_id",
@@ -776,6 +795,7 @@ def build_accepted_signal_diagnostics(
             "state_metric_name",
             "state_metric_value",
             "setup_fingerprint",
+            "reset_reason",
             "effective_anchor_ts",
             "current_session_date",
             "actionable_signal_id",
@@ -810,6 +830,52 @@ def build_accepted_signal_diagnostics(
         repeated_accepted_signals=repeated,
         repeated_accepted_signals_by_instrument=repeated_by_instrument,
     )
+
+
+def build_setup_rearm_diagnostics(
+    records: list[ReplayValidationRecord] | tuple[ReplayValidationRecord, ...]
+) -> pd.DataFrame:
+    columns = [
+        "instrument",
+        "setup",
+        "rearm_blocked_count",
+        "accepted_rearmed_count",
+        "accepted_reset_reasons_json",
+    ]
+    rows_by_key: dict[tuple[str, str], dict[str, object]] = {}
+
+    for record in records:
+        if record.setup not in {"primary_mean_reversion", "secondary_ema_continuation"}:
+            continue
+        key = (record.symbol, record.setup)
+        row = rows_by_key.setdefault(
+            key,
+            {
+                "instrument": record.symbol,
+                "setup": record.setup,
+                "rearm_blocked_count": 0,
+                "accepted_rearmed_count": 0,
+                "accepted_reset_reasons": set(),
+            },
+        )
+        if record.rejection_reason == f"{record.setup}_rearm_blocked":
+            row["rearm_blocked_count"] = int(row["rearm_blocked_count"]) + 1
+        if record.outcome is ReplayOutcome.ACCEPTED_SIGNAL and record.reset_reason is not None:
+            row["accepted_rearmed_count"] = int(row["accepted_rearmed_count"]) + 1
+            cast_reasons = row["accepted_reset_reasons"]
+            if isinstance(cast_reasons, set):
+                cast_reasons.add(record.reset_reason)
+
+    if not rows_by_key:
+        return pd.DataFrame(columns=columns)
+
+    rows: list[dict[str, object]] = []
+    for key in sorted(rows_by_key):
+        row = rows_by_key[key]
+        reset_reasons = sorted(str(reason) for reason in row.pop("accepted_reset_reasons"))
+        row["accepted_reset_reasons_json"] = json.dumps(reset_reasons)
+        rows.append(row)
+    return pd.DataFrame(rows, columns=columns)
 
 
 def build_instrument_diagnostics(
@@ -914,6 +980,7 @@ def build_validation_summary(
     signal_frequency_by_instrument: pd.DataFrame,
     repeated_accepted_signals: pd.DataFrame,
     repeated_accepted_signals_by_instrument: pd.DataFrame,
+    setup_rearm_diagnostics: pd.DataFrame,
     instrument_diagnostics: pd.DataFrame,
 ) -> dict[str, Any]:
     accepted_bar_count = len(raw_accepted_records)
@@ -943,6 +1010,7 @@ def build_validation_summary(
         "repeated_accepted_signal_count": int(len(repeated_accepted_signals.index)),
         "suppressed_accepted_bar_count": int(len(repeated_accepted_signals.index)),
         "repeated_accepted_signals_by_instrument": repeated_accepted_signals_by_instrument.to_dict(orient="records"),
+        "setup_rearm_diagnostics": setup_rearm_diagnostics.to_dict(orient="records"),
         "instrument_diagnostics": instrument_diagnostics.to_dict(orient="records"),
     }
 
@@ -1048,6 +1116,7 @@ def _outcome_for_output(
     | RiskRejectedSignalOutput
     | DailyHaltRejectedSignalOutput
     | LiquidityNewsRejectedSignalOutput
+    | FreshnessRejectedSignalOutput
     | Any,
 ) -> ReplayOutcome:
     if isinstance(output, AcceptedSignalOutput):
@@ -1067,28 +1136,41 @@ def _reason_for_output(output: Any) -> str | None:
     return getattr(output, "rejection_reason", None)
 
 
-def _strategy_for_output(output: Any) -> str | None:
+def _candidate_for_output(output: Any) -> NQSignalResult | YMSignalResult | GoldSignalResult | None:
     if isinstance(output, AcceptedSignalOutput):
-        return output.signal.strategy.value
+        return output.candidate
+    if isinstance(output, FreshnessRejectedSignalOutput):
+        return output.candidate
     return None
+
+
+def _signal_for_output(output: Any) -> SignalCandidate | None:
+    if isinstance(output, AcceptedSignalOutput):
+        return output.signal
+    candidate = _candidate_for_output(output)
+    if candidate is None:
+        return None
+    return candidate.signal
+
+
+def _strategy_for_output(output: Any) -> str | None:
+    signal = _signal_for_output(output)
+    return signal.strategy.value if signal is not None else None
 
 
 def _setup_for_output(output: Any) -> str | None:
-    if isinstance(output, AcceptedSignalOutput):
-        return output.candidate.setup.value
-    return None
+    candidate = _candidate_for_output(output)
+    return candidate.setup.value if candidate is not None else None
 
 
 def _side_for_output(output: Any) -> str | None:
-    if isinstance(output, AcceptedSignalOutput):
-        return output.signal.side.value
-    return None
+    signal = _signal_for_output(output)
+    return signal.side.value if signal is not None else None
 
 
 def _score_for_output(output: Any) -> float | None:
-    if isinstance(output, AcceptedSignalOutput):
-        return float(output.signal.score)
-    return None
+    signal = _signal_for_output(output)
+    return float(signal.score) if signal is not None else None
 
 
 def _contracts_for_output(output: Any) -> int | None:
@@ -1098,18 +1180,26 @@ def _contracts_for_output(output: Any) -> int | None:
 
 
 def _state_metric_name_for_output(output: Any) -> str | None:
-    if not isinstance(output, AcceptedSignalOutput):
+    candidate = _candidate_for_output(output)
+    if candidate is None:
         return None
-    if hasattr(output.candidate, "vwap_distance_atr"):
+    if hasattr(candidate, "vwap_distance_atr"):
         return "vwap_distance_atr"
     return None
 
 
 def _state_metric_value_for_output(output: Any) -> float | None:
-    if not isinstance(output, AcceptedSignalOutput):
+    candidate = _candidate_for_output(output)
+    if candidate is None:
         return None
-    if hasattr(output.candidate, "vwap_distance_atr"):
-        return float(output.candidate.vwap_distance_atr)
+    if hasattr(candidate, "vwap_distance_atr"):
+        return float(candidate.vwap_distance_atr)
+    return None
+
+
+def _reset_reason_for_output(output: Any) -> str | None:
+    if isinstance(output, AcceptedSignalOutput):
+        return output.reset_reason
     return None
 
 
@@ -1248,6 +1338,7 @@ def _accepted_bar_row(
         "state_metric_name": record.state_metric_name,
         "state_metric_value": record.state_metric_value,
         "setup_fingerprint": record.setup_fingerprint,
+        "reset_reason": record.reset_reason,
         "effective_anchor_ts": _isoformat_or_none(record.effective_anchor_ts),
         "current_session_date": record.current_session_date,
         "actionable_signal_id": actionable_signal_id,

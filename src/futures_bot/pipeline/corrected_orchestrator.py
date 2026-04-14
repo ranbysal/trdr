@@ -96,6 +96,7 @@ class AcceptedSignalOutput:
     stage_events: tuple[StageEvent, ...]
     session_state: InstrumentSessionState
     strategy_candidate: StrategyCandidate
+    reset_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,13 +128,43 @@ class LiquidityNewsRejectedSignalOutput:
     session_state: InstrumentSessionState
 
 
+@dataclass(frozen=True, slots=True)
+class FreshnessRejectedSignalOutput:
+    rejection_reason: str
+    candidate: YMSignalResult | GoldSignalResult
+    stage_events: tuple[StageEvent, ...]
+    session_state: InstrumentSessionState
+
+
 CorrectedOrchestratorOutput: TypeAlias = (
     AcceptedSignalOutput
     | RejectedSignalOutput
     | RiskRejectedSignalOutput
     | DailyHaltRejectedSignalOutput
     | LiquidityNewsRejectedSignalOutput
+    | FreshnessRejectedSignalOutput
 )
+
+
+_GOLD_MEAN_REVERSION_NEUTRAL_RESET_ATR = 0.20
+_YM_CONTINUATION_PULLBACK_RESET_ATR = 0.20
+
+
+@dataclass(slots=True)
+class _SetupFreshnessState:
+    instrument_symbol: str
+    setup: str
+    side: str
+    current_session_date: str
+    effective_anchor_ts: str | None
+    pending_reset_reason: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SetupFreshnessDecision:
+    allowed: bool
+    rejection_reason: str | None = None
+    reset_reason: str | None = None
 
 
 class CorrectedSignalOrchestrator:
@@ -155,6 +186,7 @@ class CorrectedSignalOrchestrator:
         self._daily_halt_manager = DailyHaltManager()
         self._session_states: dict[str, InstrumentSessionState] = {}
         self._indicator_caches: dict[str, _IncrementalIndicatorCache] = {}
+        self._setup_freshness_states: dict[tuple[str, str, str], _SetupFreshnessState] = {}
 
     @property
     def nq_config(self) -> NQStrategyConfig:
@@ -270,6 +302,12 @@ class CorrectedSignalOrchestrator:
         )
         if liquidity_rejection is not None:
             return liquidity_rejection
+        self._observe_setup_freshness_states(
+            instrument_symbol=request.instrument.symbol,
+            session_state=session_state,
+            latest_ts=data.latest_ts,
+            data=data,
+        )
 
         evaluation = self._ym_strategy.evaluate(
             features=YMSignalFeatures(
@@ -292,6 +330,18 @@ class CorrectedSignalOrchestrator:
                 stage_events=stage_events,
                 session_state=session_state,
                 reason=evaluation.rejection_reason.value if evaluation.rejection_reason is not None else "signal_rejected",
+            )
+        freshness = self._apply_setup_freshness_gate(
+            candidate=evaluation.candidate,
+            session_state=session_state,
+            latest_ts=data.latest_ts,
+        )
+        if not freshness.allowed:
+            return self._reject_signal_for_freshness(
+                candidate=evaluation.candidate,
+                stage_events=stage_events,
+                session_state=session_state,
+                reason=freshness.rejection_reason or "setup_rearm_blocked",
             )
         stage_events.append(
             StageEvent(
@@ -331,6 +381,7 @@ class CorrectedSignalOrchestrator:
             stage_events=stage_events,
             session_state=session_state,
             instrument=request.instrument,
+            reset_reason=freshness.reset_reason,
         )
 
     def _evaluate_gold(self, request: GoldEvaluationRequest) -> CorrectedOrchestratorOutput:
@@ -349,6 +400,12 @@ class CorrectedSignalOrchestrator:
         )
         if liquidity_rejection is not None:
             return liquidity_rejection
+        self._observe_setup_freshness_states(
+            instrument_symbol=request.instrument.symbol,
+            session_state=session_state,
+            latest_ts=data.latest_ts,
+            data=data,
+        )
 
         evaluation = self._gold_strategy.evaluate(
             features=GoldSignalFeatures(
@@ -372,6 +429,18 @@ class CorrectedSignalOrchestrator:
                 stage_events=stage_events,
                 session_state=session_state,
                 reason=evaluation.rejection_reason.value if evaluation.rejection_reason is not None else "signal_rejected",
+            )
+        freshness = self._apply_setup_freshness_gate(
+            candidate=evaluation.candidate,
+            session_state=session_state,
+            latest_ts=data.latest_ts,
+        )
+        if not freshness.allowed:
+            return self._reject_signal_for_freshness(
+                candidate=evaluation.candidate,
+                stage_events=stage_events,
+                session_state=session_state,
+                reason=freshness.rejection_reason or "setup_rearm_blocked",
             )
         stage_events.append(
             StageEvent(
@@ -418,6 +487,7 @@ class CorrectedSignalOrchestrator:
             stage_events=stage_events,
             session_state=session_state,
             instrument=request.instrument,
+            reset_reason=freshness.reset_reason,
         )
 
     def _prepare_pipeline(
@@ -626,6 +696,129 @@ class CorrectedSignalOrchestrator:
         cache.latest_ema_slow = _ema_latest(close_values, span=21)
         cache.latest_atr_5m = _rolling_atr_latest(cache.active_5m_bars, window=14)
 
+    def _observe_setup_freshness_states(
+        self,
+        *,
+        instrument_symbol: str,
+        session_state: InstrumentSessionState,
+        latest_ts: datetime,
+        data: _PreparedIndicatorData,
+    ) -> None:
+        session_date = session_state.current_session.session_date.isoformat()
+        effective_anchor_ts = _isoformat_or_none(effective_anchor_timestamp(session_state, ts=latest_ts))
+        vwap_distance_atr = (
+            (data.latest_close - data.anchored_vwap) / data.atr_5m
+            if math.isfinite(data.atr_5m) and data.atr_5m > 0.0
+            else math.nan
+        )
+
+        for key, state in list(self._setup_freshness_states.items()):
+            if state.instrument_symbol != instrument_symbol:
+                continue
+            if state.current_session_date != session_date or state.effective_anchor_ts != effective_anchor_ts:
+                self._setup_freshness_states.pop(key, None)
+                continue
+            if state.pending_reset_reason is not None:
+                continue
+            if state.setup == "primary_mean_reversion":
+                reset_reason = self._gold_mean_reversion_reset_reason(state=state, vwap_distance_atr=vwap_distance_atr)
+            elif state.setup == "secondary_ema_continuation":
+                reset_reason = self._ym_continuation_reset_reason(state=state, data=data)
+            else:
+                reset_reason = None
+            if reset_reason is not None:
+                state.pending_reset_reason = reset_reason
+
+    def _apply_setup_freshness_gate(
+        self,
+        *,
+        candidate: YMSignalResult | GoldSignalResult | NQSignalResult,
+        session_state: InstrumentSessionState,
+        latest_ts: datetime,
+    ) -> _SetupFreshnessDecision:
+        setup = candidate.setup.value
+        if setup not in {"primary_mean_reversion", "secondary_ema_continuation"}:
+            return _SetupFreshnessDecision(allowed=True)
+
+        signal = candidate.signal
+        key = (signal.symbol, setup, signal.side.value)
+        session_date = session_state.current_session.session_date.isoformat()
+        effective_anchor_ts = _isoformat_or_none(effective_anchor_timestamp(session_state, ts=latest_ts))
+        state = self._setup_freshness_states.get(key)
+        if state is not None and (
+            state.current_session_date != session_date or state.effective_anchor_ts != effective_anchor_ts
+        ):
+            state = None
+            self._setup_freshness_states.pop(key, None)
+
+        if state is None:
+            self._setup_freshness_states[key] = _SetupFreshnessState(
+                instrument_symbol=signal.symbol,
+                setup=setup,
+                side=signal.side.value,
+                current_session_date=session_date,
+                effective_anchor_ts=effective_anchor_ts,
+            )
+            return _SetupFreshnessDecision(allowed=True)
+
+        if state.pending_reset_reason is None:
+            return _SetupFreshnessDecision(
+                allowed=False,
+                rejection_reason=f"{setup}_rearm_blocked",
+            )
+
+        reset_reason = state.pending_reset_reason
+        self._setup_freshness_states[key] = _SetupFreshnessState(
+            instrument_symbol=signal.symbol,
+            setup=setup,
+            side=signal.side.value,
+            current_session_date=session_date,
+            effective_anchor_ts=effective_anchor_ts,
+        )
+        return _SetupFreshnessDecision(allowed=True, reset_reason=reset_reason)
+
+    def _gold_mean_reversion_reset_reason(
+        self,
+        *,
+        state: _SetupFreshnessState,
+        vwap_distance_atr: float,
+    ) -> str | None:
+        if not math.isfinite(vwap_distance_atr):
+            return None
+        if state.side == "buy":
+            if vwap_distance_atr >= 0.0:
+                return "anchor_cross_then_restretched"
+        elif state.side == "sell" and vwap_distance_atr <= 0.0:
+            return "anchor_cross_then_restretched"
+        if abs(vwap_distance_atr) <= _GOLD_MEAN_REVERSION_NEUTRAL_RESET_ATR:
+            return "stretch_neutralized_then_restretched"
+        return None
+
+    def _ym_continuation_reset_reason(
+        self,
+        *,
+        state: _SetupFreshnessState,
+        data: _PreparedIndicatorData,
+    ) -> str | None:
+        if not math.isfinite(data.atr_5m) or data.atr_5m <= 0.0:
+            return None
+        pullback_distance = _YM_CONTINUATION_PULLBACK_RESET_ATR * data.atr_5m
+        if state.side == "buy":
+            if data.latest_close <= data.anchored_vwap:
+                return "anchored_vwap_lost_then_requalified"
+            if data.ema_fast <= data.ema_slow:
+                return "ema_trend_lost_then_requalified"
+            if data.latest_close <= data.ema_fast - pullback_distance:
+                return "material_pullback_then_requalified"
+            return None
+        if data.latest_close >= data.anchored_vwap:
+            return "anchored_vwap_lost_then_requalified"
+        if data.ema_fast >= data.ema_slow:
+            return "ema_trend_lost_then_requalified"
+        if data.latest_close >= data.ema_fast + pullback_distance:
+            return "material_pullback_then_requalified"
+        return None
+
     def _liquidity_gate(
         self,
         *,
@@ -706,6 +899,35 @@ class CorrectedSignalOrchestrator:
         )
         return RejectedSignalOutput(
             rejection_reason=reason,
+            stage_events=tuple(stage_events),
+            session_state=session_state,
+        )
+
+    def _reject_signal_for_freshness(
+        self,
+        *,
+        candidate: YMSignalResult | GoldSignalResult | NQSignalResult,
+        stage_events: list[StageEvent],
+        session_state: InstrumentSessionState,
+        reason: str,
+    ) -> FreshnessRejectedSignalOutput:
+        stage_events.append(
+            StageEvent(
+                stage=EvaluationStage.INSTRUMENT_SIGNAL_EVALUATION,
+                status=StageStatus.REJECTED,
+                reason=reason,
+            )
+        )
+        stage_events.append(
+            StageEvent(
+                stage=EvaluationStage.FINAL_SIGNAL_OUTPUT,
+                status=StageStatus.REJECTED,
+                reason="rejected_signal",
+            )
+        )
+        return FreshnessRejectedSignalOutput(
+            rejection_reason=reason,
+            candidate=candidate,
             stage_events=tuple(stage_events),
             session_state=session_state,
         )
@@ -811,6 +1033,7 @@ class CorrectedSignalOrchestrator:
         stage_events: list[StageEvent],
         session_state: InstrumentSessionState,
         instrument: InstrumentMeta,
+        reset_reason: str | None = None,
     ) -> AcceptedSignalOutput:
         stage_events.append(
             StageEvent(
@@ -834,6 +1057,7 @@ class CorrectedSignalOrchestrator:
             stage_events=tuple(stage_events),
             session_state=session_state,
             strategy_candidate=strategy_candidate,
+            reset_reason=reset_reason,
         )
 
     def _finalize_stage_rejection(
@@ -945,6 +1169,10 @@ class _IncrementalIndicatorCache:
         self.latest_ema_fast = math.nan
         self.latest_ema_slow = math.nan
         self.latest_atr_5m = math.nan
+
+
+def _isoformat_or_none(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
 
 
 def _row_value(row: object, key: str) -> object:
