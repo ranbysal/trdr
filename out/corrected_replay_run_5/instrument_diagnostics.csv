@@ -1,0 +1,4 @@
+instrument,accepted_bar_count,actionable_signal_count,rejected_signal_count,suppressed_accepted_bar_count,suppressed_actionable_signal_count,top_rejection_reason,top_rejection_count,probable_zero_signal_cause
+GOLD,162,162,12061,0,0,no_mean_reversion_or_structural_setup,8628,
+NQ,214,214,12995,0,0,order_block_alignment_failed,4842,
+YM,216,216,12864,0,0,secondary_ema_continuation_rearm_blocked,5756,

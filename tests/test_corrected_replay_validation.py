@@ -857,13 +857,25 @@ def test_ym_secondary_continuation_requires_real_reset_before_rearm(tmp_path: Pa
     assert ym_accepts["actionable_signal_id"].nunique() == 2
     assert ym_accepts["reset_reason"].isna().sum() == 1
     assert ym_accepts["reset_reason"].dropna().tolist() == ["material_pullback_then_requalified"]
+    assert ym_accepts["same_fingerprint_accept_count"].tolist() == [1, 2]
+    assert pd.isna(ym_accepts.iloc[0]["reset_state_id"])
+    assert pd.isna(ym_accepts.iloc[0]["bars_since_reset"])
+    assert isinstance(ym_accepts.iloc[1]["reset_state_id"], str)
+    assert int(ym_accepts.iloc[1]["bars_since_reset"]) >= 2
     assert len(ym_rearm_blocks.index) >= 1
+    assert {"reset_state_id", "bars_since_reset", "same_fingerprint_accept_count", "stricter_rearm_blocked"} <= set(
+        rejected.columns
+    )
+    assert ym_rearm_blocks["same_fingerprint_accept_count"].dropna().ge(1).all()
+    stricter_flags = ym_rearm_blocks["stricter_rearm_blocked"].astype(str).str.lower().eq("true")
 
     diag = rearm_diagnostics.loc[
         (rearm_diagnostics["instrument"] == "YM")
         & (rearm_diagnostics["setup"] == "secondary_ema_continuation")
     ].iloc[0]
     assert int(diag["rearm_blocked_count"]) == len(ym_rearm_blocks.index)
+    assert int(diag["stricter_rearm_blocked_count"]) >= 0
+    assert int(diag["stricter_rearm_blocked_count"]) == int(stricter_flags.sum())
     assert int(diag["accepted_rearmed_count"]) == 1
     assert "material_pullback_then_requalified" in str(diag["accepted_reset_reasons_json"])
 

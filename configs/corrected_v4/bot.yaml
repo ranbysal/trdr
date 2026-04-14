@@ -1,0 +1,29 @@
+bot:
+  name: corrected_v4
+  architecture: corrected_futures_orchestrator
+  mode: live_signals_only
+  dataset: GLBX.MDP3
+  schema: ohlcv-1m
+  stype_in: continuous
+  alert_tag: "[CORR-V4]"
+  starting_equity: 100000.0
+  gold_symbol: MGC
+
+runtime:
+  databento_symbols:
+    - NQ.v.0
+    - YM.v.0
+    - GC.v.0
+  heartbeat_interval_hours: 4.0
+  bars_stale_after_s: 180.0
+
+risk:
+  nq:
+    hard_risk_per_trade_dollars: 750.0
+    daily_halt_loss_dollars: 1500.0
+  ym:
+    hard_risk_per_trade_dollars: 500.0
+    daily_halt_loss_dollars: 1500.0
+  gold:
+    hard_risk_per_trade_dollars: 400.0
+    daily_halt_loss_dollars: 1200.0

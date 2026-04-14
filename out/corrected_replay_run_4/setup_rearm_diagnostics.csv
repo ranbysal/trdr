@@ -1,0 +1,4 @@
+instrument,setup,rearm_blocked_count,accepted_rearmed_count,accepted_reset_reasons_json
+GOLD,primary_mean_reversion,2333,133,"[""anchor_cross_then_restretched"", ""stretch_neutralized_then_restretched""]"
+YM,primary_mean_reversion,1263,47,"[""anchor_cross_then_restretched"", ""stretch_neutralized_then_restretched""]"
+YM,secondary_ema_continuation,5578,288,"[""anchored_vwap_lost_then_requalified"", ""ema_trend_lost_then_requalified"", ""material_pullback_then_requalified""]"

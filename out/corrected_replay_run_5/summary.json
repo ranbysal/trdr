@@ -1,0 +1,343 @@
+{
+  "accepted_bar_count": 592,
+  "accepted_bars_by_instrument": [
+    {
+      "accepted_bar_count": 162,
+      "instrument": "GOLD"
+    },
+    {
+      "accepted_bar_count": 214,
+      "instrument": "NQ"
+    },
+    {
+      "accepted_bar_count": 216,
+      "instrument": "YM"
+    }
+  ],
+  "accepted_signal_count": 592,
+  "accepted_signals_by_instrument": [
+    {
+      "actionable_signal_count": 162,
+      "instrument": "GOLD"
+    },
+    {
+      "actionable_signal_count": 214,
+      "instrument": "NQ"
+    },
+    {
+      "actionable_signal_count": 216,
+      "instrument": "YM"
+    }
+  ],
+  "actionable_signal_count": 592,
+  "actionable_signals_by_instrument": [
+    {
+      "actionable_signal_count": 162,
+      "instrument": "GOLD"
+    },
+    {
+      "actionable_signal_count": 214,
+      "instrument": "NQ"
+    },
+    {
+      "actionable_signal_count": 216,
+      "instrument": "YM"
+    }
+  ],
+  "average_signal_frequency_by_instrument": [
+    {
+      "accepted_bar_count": 162,
+      "accepted_bars_per_active_day": 14.727272727272727,
+      "actionable_signal_count": 162,
+      "actionable_signals_per_active_day": 14.727272727272727,
+      "active_days": 11,
+      "instrument": "GOLD"
+    },
+    {
+      "accepted_bar_count": 214,
+      "accepted_bars_per_active_day": 17.833333333333332,
+      "actionable_signal_count": 214,
+      "actionable_signals_per_active_day": 17.833333333333332,
+      "active_days": 12,
+      "instrument": "NQ"
+    },
+    {
+      "accepted_bar_count": 216,
+      "accepted_bars_per_active_day": 18.0,
+      "actionable_signal_count": 216,
+      "actionable_signals_per_active_day": 18.0,
+      "active_days": 12,
+      "instrument": "YM"
+    }
+  ],
+  "daily_halt_event_count": 0,
+  "daily_halt_events": [],
+  "daily_halt_occurrences": [
+    {
+      "daily_halt_occurrences": 0
+    }
+  ],
+  "instrument_diagnostics": [
+    {
+      "accepted_bar_count": 162,
+      "actionable_signal_count": 162,
+      "instrument": "GOLD",
+      "probable_zero_signal_cause": null,
+      "rejected_signal_count": 12061,
+      "suppressed_accepted_bar_count": 0,
+      "suppressed_actionable_signal_count": 0,
+      "top_rejection_count": 8628,
+      "top_rejection_reason": "no_mean_reversion_or_structural_setup"
+    },
+    {
+      "accepted_bar_count": 214,
+      "actionable_signal_count": 214,
+      "instrument": "NQ",
+      "probable_zero_signal_cause": null,
+      "rejected_signal_count": 12995,
+      "suppressed_accepted_bar_count": 0,
+      "suppressed_actionable_signal_count": 0,
+      "top_rejection_count": 4842,
+      "top_rejection_reason": "order_block_alignment_failed"
+    },
+    {
+      "accepted_bar_count": 216,
+      "actionable_signal_count": 216,
+      "instrument": "YM",
+      "probable_zero_signal_cause": null,
+      "rejected_signal_count": 12864,
+      "suppressed_accepted_bar_count": 0,
+      "suppressed_actionable_signal_count": 0,
+      "top_rejection_count": 5756,
+      "top_rejection_reason": "secondary_ema_continuation_rearm_blocked"
+    }
+  ],
+  "record_count": 38512,
+  "rejected_signal_count": 37920,
+  "rejection_reason_counts": [
+    {
+      "count": 27,
+      "rejection_reason": "HARD_RISK_CAP_EXCEEDED"
+    },
+    {
+      "count": 33,
+      "rejection_reason": "INVALID_STOP_DISTANCE"
+    },
+    {
+      "count": 3282,
+      "rejection_reason": "ema_alignment_failed"
+    },
+    {
+      "count": 3300,
+      "rejection_reason": "indicator_data_unavailable"
+    },
+    {
+      "count": 4739,
+      "rejection_reason": "no_mean_reversion_or_ema_continuation_setup"
+    },
+    {
+      "count": 8628,
+      "rejection_reason": "no_mean_reversion_or_structural_setup"
+    },
+    {
+      "count": 4842,
+      "rejection_reason": "order_block_alignment_failed"
+    },
+    {
+      "count": 3596,
+      "rejection_reason": "primary_mean_reversion_rearm_blocked"
+    },
+    {
+      "count": 5756,
+      "rejection_reason": "secondary_ema_continuation_rearm_blocked"
+    },
+    {
+      "count": 3717,
+      "rejection_reason": "structure_continuation_failed"
+    }
+  ],
+  "rejection_reason_counts_by_instrument": [
+    {
+      "count": 1100,
+      "instrument": "GOLD",
+      "rejection_reason": "indicator_data_unavailable"
+    },
+    {
+      "count": 8628,
+      "instrument": "GOLD",
+      "rejection_reason": "no_mean_reversion_or_structural_setup"
+    },
+    {
+      "count": 2333,
+      "instrument": "GOLD",
+      "rejection_reason": "primary_mean_reversion_rearm_blocked"
+    },
+    {
+      "count": 21,
+      "instrument": "NQ",
+      "rejection_reason": "HARD_RISK_CAP_EXCEEDED"
+    },
+    {
+      "count": 33,
+      "instrument": "NQ",
+      "rejection_reason": "INVALID_STOP_DISTANCE"
+    },
+    {
+      "count": 3282,
+      "instrument": "NQ",
+      "rejection_reason": "ema_alignment_failed"
+    },
+    {
+      "count": 1100,
+      "instrument": "NQ",
+      "rejection_reason": "indicator_data_unavailable"
+    },
+    {
+      "count": 4842,
+      "instrument": "NQ",
+      "rejection_reason": "order_block_alignment_failed"
+    },
+    {
+      "count": 3717,
+      "instrument": "NQ",
+      "rejection_reason": "structure_continuation_failed"
+    },
+    {
+      "count": 6,
+      "instrument": "YM",
+      "rejection_reason": "HARD_RISK_CAP_EXCEEDED"
+    },
+    {
+      "count": 1100,
+      "instrument": "YM",
+      "rejection_reason": "indicator_data_unavailable"
+    },
+    {
+      "count": 4739,
+      "instrument": "YM",
+      "rejection_reason": "no_mean_reversion_or_ema_continuation_setup"
+    },
+    {
+      "count": 1263,
+      "instrument": "YM",
+      "rejection_reason": "primary_mean_reversion_rearm_blocked"
+    },
+    {
+      "count": 5756,
+      "instrument": "YM",
+      "rejection_reason": "secondary_ema_continuation_rearm_blocked"
+    }
+  ],
+  "rejections_by_reason": [
+    {
+      "count": 27,
+      "rejection_reason": "HARD_RISK_CAP_EXCEEDED"
+    },
+    {
+      "count": 33,
+      "rejection_reason": "INVALID_STOP_DISTANCE"
+    },
+    {
+      "count": 3282,
+      "rejection_reason": "ema_alignment_failed"
+    },
+    {
+      "count": 3300,
+      "rejection_reason": "indicator_data_unavailable"
+    },
+    {
+      "count": 4739,
+      "rejection_reason": "no_mean_reversion_or_ema_continuation_setup"
+    },
+    {
+      "count": 8628,
+      "rejection_reason": "no_mean_reversion_or_structural_setup"
+    },
+    {
+      "count": 4842,
+      "rejection_reason": "order_block_alignment_failed"
+    },
+    {
+      "count": 3596,
+      "rejection_reason": "primary_mean_reversion_rearm_blocked"
+    },
+    {
+      "count": 5756,
+      "rejection_reason": "secondary_ema_continuation_rearm_blocked"
+    },
+    {
+      "count": 3717,
+      "rejection_reason": "structure_continuation_failed"
+    }
+  ],
+  "repeated_accepted_signal_count": 0,
+  "repeated_accepted_signals_by_instrument": [],
+  "risk_skip_count": 60,
+  "setup_rearm_diagnostics": [
+    {
+      "accepted_rearmed_count": 133,
+      "accepted_reset_reasons_json": "[\"anchor_cross_then_restretched\", \"stretch_neutralized_then_restretched\"]",
+      "instrument": "GOLD",
+      "rearm_blocked_count": 2333,
+      "setup": "primary_mean_reversion",
+      "stricter_rearm_blocked_count": 0
+    },
+    {
+      "accepted_rearmed_count": 47,
+      "accepted_reset_reasons_json": "[\"anchor_cross_then_restretched\", \"stretch_neutralized_then_restretched\"]",
+      "instrument": "YM",
+      "rearm_blocked_count": 1263,
+      "setup": "primary_mean_reversion",
+      "stricter_rearm_blocked_count": 0
+    },
+    {
+      "accepted_rearmed_count": 114,
+      "accepted_reset_reasons_json": "[\"anchored_vwap_lost_then_requalified\", \"ema_trend_lost_then_requalified\", \"material_pullback_then_requalified\"]",
+      "instrument": "YM",
+      "rearm_blocked_count": 5756,
+      "setup": "secondary_ema_continuation",
+      "stricter_rearm_blocked_count": 1786
+    }
+  ],
+  "signal_frequency_by_instrument": [
+    {
+      "accepted_bar_count": 162,
+      "accepted_bars_per_active_day": 14.727272727272727,
+      "actionable_signal_count": 162,
+      "actionable_signals_per_active_day": 14.727272727272727,
+      "active_days": 11,
+      "instrument": "GOLD"
+    },
+    {
+      "accepted_bar_count": 214,
+      "accepted_bars_per_active_day": 17.833333333333332,
+      "actionable_signal_count": 214,
+      "actionable_signals_per_active_day": 17.833333333333332,
+      "active_days": 12,
+      "instrument": "NQ"
+    },
+    {
+      "accepted_bar_count": 216,
+      "accepted_bars_per_active_day": 18.0,
+      "actionable_signal_count": 216,
+      "actionable_signals_per_active_day": 18.0,
+      "active_days": 12,
+      "instrument": "YM"
+    }
+  ],
+  "signals_by_instrument": [
+    {
+      "actionable_signal_count": 162,
+      "instrument": "GOLD"
+    },
+    {
+      "actionable_signal_count": 214,
+      "instrument": "NQ"
+    },
+    {
+      "actionable_signal_count": 216,
+      "instrument": "YM"
+    }
+  ],
+  "suppressed_accepted_bar_count": 0
+}

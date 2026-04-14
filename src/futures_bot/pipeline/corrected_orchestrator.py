@@ -97,6 +97,9 @@ class AcceptedSignalOutput:
     session_state: InstrumentSessionState
     strategy_candidate: StrategyCandidate
     reset_reason: str | None = None
+    reset_state_id: str | None = None
+    bars_since_reset: int | None = None
+    same_fingerprint_accept_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +137,10 @@ class FreshnessRejectedSignalOutput:
     candidate: YMSignalResult | GoldSignalResult
     stage_events: tuple[StageEvent, ...]
     session_state: InstrumentSessionState
+    reset_state_id: str | None = None
+    bars_since_reset: int | None = None
+    same_fingerprint_accept_count: int | None = None
+    stricter_rearm_blocked: bool = False
 
 
 CorrectedOrchestratorOutput: TypeAlias = (
@@ -147,7 +154,12 @@ CorrectedOrchestratorOutput: TypeAlias = (
 
 
 _GOLD_MEAN_REVERSION_NEUTRAL_RESET_ATR = 0.20
-_YM_CONTINUATION_PULLBACK_RESET_ATR = 0.20
+_YM_CONTINUATION_PULLBACK_RESET_ATR = 0.35
+_YM_CONTINUATION_REQUALIFY_EMA_BUFFER_ATR = 0.10
+_YM_CONTINUATION_REQUALIFY_VWAP_BUFFER_ATR = 0.10
+_YM_CONTINUATION_REQUALIFY_TREND_SPREAD_ATR = 0.05
+_YM_CONTINUATION_MIN_BARS_SINCE_RESET = 2
+_YM_CONTINUATION_RESET_STATE_BUCKET_ATR = 0.25
 
 
 @dataclass(slots=True)
@@ -158,6 +170,11 @@ class _SetupFreshnessState:
     current_session_date: str
     effective_anchor_ts: str | None
     pending_reset_reason: str | None = None
+    pending_reset_state_id: str | None = None
+    bars_since_reset: int | None = None
+    last_accepted_reset_state_id: str | None = None
+    same_fingerprint_accept_count: int = 1
+    stricter_rearm_blocked_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +182,16 @@ class _SetupFreshnessDecision:
     allowed: bool
     rejection_reason: str | None = None
     reset_reason: str | None = None
+    reset_state_id: str | None = None
+    bars_since_reset: int | None = None
+    same_fingerprint_accept_count: int | None = None
+    stricter_rearm_blocked: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _YMContinuationResetSnapshot:
+    reason: str
+    state_id: str
 
 
 class CorrectedSignalOrchestrator:
@@ -335,6 +362,7 @@ class CorrectedSignalOrchestrator:
             candidate=evaluation.candidate,
             session_state=session_state,
             latest_ts=data.latest_ts,
+            data=data,
         )
         if not freshness.allowed:
             return self._reject_signal_for_freshness(
@@ -342,6 +370,10 @@ class CorrectedSignalOrchestrator:
                 stage_events=stage_events,
                 session_state=session_state,
                 reason=freshness.rejection_reason or "setup_rearm_blocked",
+                reset_state_id=freshness.reset_state_id,
+                bars_since_reset=freshness.bars_since_reset,
+                same_fingerprint_accept_count=freshness.same_fingerprint_accept_count,
+                stricter_rearm_blocked=freshness.stricter_rearm_blocked,
             )
         stage_events.append(
             StageEvent(
@@ -382,6 +414,9 @@ class CorrectedSignalOrchestrator:
             session_state=session_state,
             instrument=request.instrument,
             reset_reason=freshness.reset_reason,
+            reset_state_id=freshness.reset_state_id,
+            bars_since_reset=freshness.bars_since_reset,
+            same_fingerprint_accept_count=freshness.same_fingerprint_accept_count,
         )
 
     def _evaluate_gold(self, request: GoldEvaluationRequest) -> CorrectedOrchestratorOutput:
@@ -434,6 +469,7 @@ class CorrectedSignalOrchestrator:
             candidate=evaluation.candidate,
             session_state=session_state,
             latest_ts=data.latest_ts,
+            data=data,
         )
         if not freshness.allowed:
             return self._reject_signal_for_freshness(
@@ -441,6 +477,10 @@ class CorrectedSignalOrchestrator:
                 stage_events=stage_events,
                 session_state=session_state,
                 reason=freshness.rejection_reason or "setup_rearm_blocked",
+                reset_state_id=freshness.reset_state_id,
+                bars_since_reset=freshness.bars_since_reset,
+                same_fingerprint_accept_count=freshness.same_fingerprint_accept_count,
+                stricter_rearm_blocked=freshness.stricter_rearm_blocked,
             )
         stage_events.append(
             StageEvent(
@@ -488,6 +528,9 @@ class CorrectedSignalOrchestrator:
             session_state=session_state,
             instrument=request.instrument,
             reset_reason=freshness.reset_reason,
+            reset_state_id=freshness.reset_state_id,
+            bars_since_reset=freshness.bars_since_reset,
+            same_fingerprint_accept_count=freshness.same_fingerprint_accept_count,
         )
 
     def _prepare_pipeline(
@@ -719,15 +762,27 @@ class CorrectedSignalOrchestrator:
                 self._setup_freshness_states.pop(key, None)
                 continue
             if state.pending_reset_reason is not None:
+                if state.setup == "secondary_ema_continuation":
+                    reset_snapshot = self._ym_continuation_reset_snapshot(state=state, data=data)
+                    if reset_snapshot is not None and reset_snapshot.state_id != state.pending_reset_state_id:
+                        state.pending_reset_reason = reset_snapshot.reason
+                        state.pending_reset_state_id = reset_snapshot.state_id
+                        state.bars_since_reset = 0
+                    elif state.bars_since_reset is not None:
+                        state.bars_since_reset += 1
                 continue
             if state.setup == "primary_mean_reversion":
                 reset_reason = self._gold_mean_reversion_reset_reason(state=state, vwap_distance_atr=vwap_distance_atr)
             elif state.setup == "secondary_ema_continuation":
-                reset_reason = self._ym_continuation_reset_reason(state=state, data=data)
+                reset_snapshot = self._ym_continuation_reset_snapshot(state=state, data=data)
+                reset_reason = reset_snapshot.reason if reset_snapshot is not None else None
             else:
                 reset_reason = None
             if reset_reason is not None:
                 state.pending_reset_reason = reset_reason
+                if state.setup == "secondary_ema_continuation":
+                    state.pending_reset_state_id = reset_snapshot.state_id if reset_snapshot is not None else None
+                    state.bars_since_reset = 0
 
     def _apply_setup_freshness_gate(
         self,
@@ -735,6 +790,7 @@ class CorrectedSignalOrchestrator:
         candidate: YMSignalResult | GoldSignalResult | NQSignalResult,
         session_state: InstrumentSessionState,
         latest_ts: datetime,
+        data: _PreparedIndicatorData | None = None,
     ) -> _SetupFreshnessDecision:
         setup = candidate.setup.value
         if setup not in {"primary_mean_reversion", "secondary_ema_continuation"}:
@@ -759,12 +815,20 @@ class CorrectedSignalOrchestrator:
                 current_session_date=session_date,
                 effective_anchor_ts=effective_anchor_ts,
             )
-            return _SetupFreshnessDecision(allowed=True)
+            return _SetupFreshnessDecision(allowed=True, same_fingerprint_accept_count=1)
+
+        if setup == "secondary_ema_continuation":
+            return self._apply_ym_continuation_freshness_gate(
+                state=state,
+                rejection_reason=f"{setup}_rearm_blocked",
+                data=data,
+            )
 
         if state.pending_reset_reason is None:
             return _SetupFreshnessDecision(
                 allowed=False,
                 rejection_reason=f"{setup}_rearm_blocked",
+                same_fingerprint_accept_count=state.same_fingerprint_accept_count,
             )
 
         reset_reason = state.pending_reset_reason
@@ -775,7 +839,11 @@ class CorrectedSignalOrchestrator:
             current_session_date=session_date,
             effective_anchor_ts=effective_anchor_ts,
         )
-        return _SetupFreshnessDecision(allowed=True, reset_reason=reset_reason)
+        return _SetupFreshnessDecision(
+            allowed=True,
+            reset_reason=reset_reason,
+            same_fingerprint_accept_count=1,
+        )
 
     def _gold_mean_reversion_reset_reason(
         self,
@@ -794,30 +862,144 @@ class CorrectedSignalOrchestrator:
             return "stretch_neutralized_then_restretched"
         return None
 
-    def _ym_continuation_reset_reason(
+    def _apply_ym_continuation_freshness_gate(
+        self,
+        *,
+        state: _SetupFreshnessState,
+        rejection_reason: str,
+        data: _PreparedIndicatorData | None,
+    ) -> _SetupFreshnessDecision:
+        if state.pending_reset_reason is None:
+            return _SetupFreshnessDecision(
+                allowed=False,
+                rejection_reason=rejection_reason,
+                same_fingerprint_accept_count=state.same_fingerprint_accept_count,
+            )
+        if data is None or not self._ym_continuation_has_fresh_impulse(state=state, data=data):
+            state.stricter_rearm_blocked_count += 1
+            return _SetupFreshnessDecision(
+                allowed=False,
+                rejection_reason=rejection_reason,
+                reset_state_id=state.pending_reset_state_id,
+                bars_since_reset=state.bars_since_reset,
+                same_fingerprint_accept_count=state.same_fingerprint_accept_count,
+                stricter_rearm_blocked=True,
+            )
+        if state.pending_reset_state_id == state.last_accepted_reset_state_id:
+            state.stricter_rearm_blocked_count += 1
+            return _SetupFreshnessDecision(
+                allowed=False,
+                rejection_reason=rejection_reason,
+                reset_state_id=state.pending_reset_state_id,
+                bars_since_reset=state.bars_since_reset,
+                same_fingerprint_accept_count=state.same_fingerprint_accept_count,
+                stricter_rearm_blocked=True,
+            )
+
+        state.same_fingerprint_accept_count += 1
+        accepted_reset_reason = state.pending_reset_reason
+        accepted_reset_state_id = state.pending_reset_state_id
+        accepted_bars_since_reset = state.bars_since_reset
+        state.last_accepted_reset_state_id = accepted_reset_state_id
+        state.pending_reset_reason = None
+        state.pending_reset_state_id = None
+        state.bars_since_reset = None
+        return _SetupFreshnessDecision(
+            allowed=True,
+            reset_reason=accepted_reset_reason,
+            reset_state_id=accepted_reset_state_id,
+            bars_since_reset=accepted_bars_since_reset,
+            same_fingerprint_accept_count=state.same_fingerprint_accept_count,
+        )
+
+    def _ym_continuation_reset_snapshot(
         self,
         *,
         state: _SetupFreshnessState,
         data: _PreparedIndicatorData,
-    ) -> str | None:
+    ) -> _YMContinuationResetSnapshot | None:
         if not math.isfinite(data.atr_5m) or data.atr_5m <= 0.0:
             return None
         pullback_distance = _YM_CONTINUATION_PULLBACK_RESET_ATR * data.atr_5m
         if state.side == "buy":
             if data.latest_close <= data.anchored_vwap:
-                return "anchored_vwap_lost_then_requalified"
+                return _YMContinuationResetSnapshot(
+                    reason="anchored_vwap_lost_then_requalified",
+                    state_id=self._ym_continuation_reset_state_id(state=state, data=data),
+                )
             if data.ema_fast <= data.ema_slow:
-                return "ema_trend_lost_then_requalified"
+                return _YMContinuationResetSnapshot(
+                    reason="ema_trend_lost_then_requalified",
+                    state_id=self._ym_continuation_reset_state_id(state=state, data=data),
+                )
             if data.latest_close <= data.ema_fast - pullback_distance:
-                return "material_pullback_then_requalified"
+                return _YMContinuationResetSnapshot(
+                    reason="material_pullback_then_requalified",
+                    state_id=self._ym_continuation_reset_state_id(state=state, data=data),
+                )
             return None
         if data.latest_close >= data.anchored_vwap:
-            return "anchored_vwap_lost_then_requalified"
+            return _YMContinuationResetSnapshot(
+                reason="anchored_vwap_lost_then_requalified",
+                state_id=self._ym_continuation_reset_state_id(state=state, data=data),
+            )
         if data.ema_fast >= data.ema_slow:
-            return "ema_trend_lost_then_requalified"
+            return _YMContinuationResetSnapshot(
+                reason="ema_trend_lost_then_requalified",
+                state_id=self._ym_continuation_reset_state_id(state=state, data=data),
+            )
         if data.latest_close >= data.ema_fast + pullback_distance:
-            return "material_pullback_then_requalified"
+            return _YMContinuationResetSnapshot(
+                reason="material_pullback_then_requalified",
+                state_id=self._ym_continuation_reset_state_id(state=state, data=data),
+            )
         return None
+
+    def _ym_continuation_has_fresh_impulse(
+        self,
+        *,
+        state: _SetupFreshnessState,
+        data: _PreparedIndicatorData,
+    ) -> bool:
+        if not math.isfinite(data.atr_5m) or data.atr_5m <= 0.0:
+            return False
+        if state.bars_since_reset is None or state.bars_since_reset < _YM_CONTINUATION_MIN_BARS_SINCE_RESET:
+            return False
+        impulse_distance = _YM_CONTINUATION_REQUALIFY_EMA_BUFFER_ATR * data.atr_5m
+        vwap_buffer = _YM_CONTINUATION_REQUALIFY_VWAP_BUFFER_ATR * data.atr_5m
+        trend_spread = _YM_CONTINUATION_REQUALIFY_TREND_SPREAD_ATR * data.atr_5m
+        if state.side == "buy":
+            return (
+                data.latest_close >= data.ema_fast + impulse_distance
+                and data.latest_close >= data.anchored_vwap + vwap_buffer
+                and data.ema_fast >= data.ema_slow + trend_spread
+            )
+        return (
+            data.latest_close <= data.ema_fast - impulse_distance
+            and data.latest_close <= data.anchored_vwap - vwap_buffer
+            and data.ema_fast <= data.ema_slow - trend_spread
+        )
+
+    def _ym_continuation_reset_state_id(
+        self,
+        *,
+        state: _SetupFreshnessState,
+        data: _PreparedIndicatorData,
+    ) -> str:
+        if state.side == "buy":
+            anchor_loss_atr = max((data.anchored_vwap - data.latest_close) / data.atr_5m, 0.0)
+            pullback_atr = max((data.ema_fast - data.latest_close) / data.atr_5m, 0.0)
+            trend_loss_atr = max((data.ema_slow - data.ema_fast) / data.atr_5m, 0.0)
+        else:
+            anchor_loss_atr = max((data.latest_close - data.anchored_vwap) / data.atr_5m, 0.0)
+            pullback_atr = max((data.latest_close - data.ema_fast) / data.atr_5m, 0.0)
+            trend_loss_atr = max((data.ema_fast - data.ema_slow) / data.atr_5m, 0.0)
+        return (
+            f"{state.side}:"
+            f"anchor{_bucket_atr_distance(anchor_loss_atr)}:"
+            f"pullback{_bucket_atr_distance(pullback_atr)}:"
+            f"trend{_bucket_atr_distance(trend_loss_atr)}"
+        )
 
     def _liquidity_gate(
         self,
@@ -910,6 +1092,10 @@ class CorrectedSignalOrchestrator:
         stage_events: list[StageEvent],
         session_state: InstrumentSessionState,
         reason: str,
+        reset_state_id: str | None = None,
+        bars_since_reset: int | None = None,
+        same_fingerprint_accept_count: int | None = None,
+        stricter_rearm_blocked: bool = False,
     ) -> FreshnessRejectedSignalOutput:
         stage_events.append(
             StageEvent(
@@ -930,6 +1116,10 @@ class CorrectedSignalOrchestrator:
             candidate=candidate,
             stage_events=tuple(stage_events),
             session_state=session_state,
+            reset_state_id=reset_state_id,
+            bars_since_reset=bars_since_reset,
+            same_fingerprint_accept_count=same_fingerprint_accept_count,
+            stricter_rearm_blocked=stricter_rearm_blocked,
         )
 
     def _size_signal(
@@ -1034,6 +1224,9 @@ class CorrectedSignalOrchestrator:
         session_state: InstrumentSessionState,
         instrument: InstrumentMeta,
         reset_reason: str | None = None,
+        reset_state_id: str | None = None,
+        bars_since_reset: int | None = None,
+        same_fingerprint_accept_count: int | None = None,
     ) -> AcceptedSignalOutput:
         stage_events.append(
             StageEvent(
@@ -1058,6 +1251,9 @@ class CorrectedSignalOrchestrator:
             session_state=session_state,
             strategy_candidate=strategy_candidate,
             reset_reason=reset_reason,
+            reset_state_id=reset_state_id,
+            bars_since_reset=bars_since_reset,
+            same_fingerprint_accept_count=same_fingerprint_accept_count,
         )
 
     def _finalize_stage_rejection(
@@ -1173,6 +1369,12 @@ class _IncrementalIndicatorCache:
 
 def _isoformat_or_none(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _bucket_atr_distance(distance_atr: float) -> int:
+    if not math.isfinite(distance_atr) or distance_atr <= 0.0:
+        return 0
+    return int(distance_atr / _YM_CONTINUATION_RESET_STATE_BUCKET_ATR)
 
 
 def _row_value(row: object, key: str) -> object:

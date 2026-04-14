@@ -64,6 +64,10 @@ class ReplayValidationRecord:
     state_metric_value: float | None
     setup_fingerprint: str | None
     reset_reason: str | None
+    reset_state_id: str | None
+    bars_since_reset: int | None
+    same_fingerprint_accept_count: int | None
+    stricter_rearm_blocked: bool
     effective_anchor_ts: datetime | None
     current_session_date: str
     stage_events: tuple[StageEvent, ...]
@@ -202,6 +206,10 @@ def _run_corrected_validation_replay_rows(
                         current_session_date=session_state.current_session.session_date.isoformat(),
                     ),
                     reset_reason=_reset_reason_for_output(output),
+                    reset_state_id=_reset_state_id_for_output(output),
+                    bars_since_reset=_bars_since_reset_for_output(output),
+                    same_fingerprint_accept_count=_same_fingerprint_accept_count_for_output(output),
+                    stricter_rearm_blocked=_stricter_rearm_blocked_for_output(output),
                     effective_anchor_ts=effective_anchor_ts,
                     current_session_date=session_state.current_session.session_date.isoformat(),
                     stage_events=output.stage_events,
@@ -335,6 +343,9 @@ def build_accepted_bars(records: pd.DataFrame) -> pd.DataFrame:
                 "state_metric_value",
                 "setup_fingerprint",
                 "reset_reason",
+                "reset_state_id",
+                "bars_since_reset",
+                "same_fingerprint_accept_count",
                 "effective_anchor_ts",
                 "current_session_date",
                 "actionable_signal_id",
@@ -358,6 +369,9 @@ def build_accepted_bars(records: pd.DataFrame) -> pd.DataFrame:
             "state_metric_value",
             "setup_fingerprint",
             "reset_reason",
+            "reset_state_id",
+            "bars_since_reset",
+            "same_fingerprint_accept_count",
             "effective_anchor_ts",
             "current_session_date",
             "actionable_signal_id",
@@ -579,6 +593,10 @@ def build_rejected_signals(records: list[ReplayValidationRecord] | tuple[ReplayV
             "strategy": record.strategy,
             "setup": record.setup,
             "side": record.side,
+            "reset_state_id": record.reset_state_id,
+            "bars_since_reset": record.bars_since_reset,
+            "same_fingerprint_accept_count": record.same_fingerprint_accept_count,
+            "stricter_rearm_blocked": record.stricter_rearm_blocked,
             "effective_anchor_ts": _isoformat_or_none(record.effective_anchor_ts),
             "current_session_date": record.current_session_date,
             "stage_events_json": _stage_events_json(record.stage_events),
@@ -596,6 +614,10 @@ def build_rejected_signals(records: list[ReplayValidationRecord] | tuple[ReplayV
             "strategy",
             "setup",
             "side",
+            "reset_state_id",
+            "bars_since_reset",
+            "same_fingerprint_accept_count",
+            "stricter_rearm_blocked",
             "effective_anchor_ts",
             "current_session_date",
             "stage_events_json",
@@ -773,6 +795,9 @@ def build_accepted_signal_diagnostics(
             "state_metric_value",
             "setup_fingerprint",
             "reset_reason",
+            "reset_state_id",
+            "bars_since_reset",
+            "same_fingerprint_accept_count",
             "effective_anchor_ts",
             "current_session_date",
             "actionable_signal_id",
@@ -839,6 +864,7 @@ def build_setup_rearm_diagnostics(
         "instrument",
         "setup",
         "rearm_blocked_count",
+        "stricter_rearm_blocked_count",
         "accepted_rearmed_count",
         "accepted_reset_reasons_json",
     ]
@@ -854,12 +880,15 @@ def build_setup_rearm_diagnostics(
                 "instrument": record.symbol,
                 "setup": record.setup,
                 "rearm_blocked_count": 0,
+                "stricter_rearm_blocked_count": 0,
                 "accepted_rearmed_count": 0,
                 "accepted_reset_reasons": set(),
             },
         )
         if record.rejection_reason == f"{record.setup}_rearm_blocked":
             row["rearm_blocked_count"] = int(row["rearm_blocked_count"]) + 1
+        if record.stricter_rearm_blocked:
+            row["stricter_rearm_blocked_count"] = int(row["stricter_rearm_blocked_count"]) + 1
         if record.outcome is ReplayOutcome.ACCEPTED_SIGNAL and record.reset_reason is not None:
             row["accepted_rearmed_count"] = int(row["accepted_rearmed_count"]) + 1
             cast_reasons = row["accepted_reset_reasons"]
@@ -1203,6 +1232,28 @@ def _reset_reason_for_output(output: Any) -> str | None:
     return None
 
 
+def _reset_state_id_for_output(output: Any) -> str | None:
+    return str(getattr(output, "reset_state_id", None) or "") or None
+
+
+def _bars_since_reset_for_output(output: Any) -> int | None:
+    value = getattr(output, "bars_since_reset", None)
+    if value is None:
+        return None
+    return int(value)
+
+
+def _same_fingerprint_accept_count_for_output(output: Any) -> int | None:
+    value = getattr(output, "same_fingerprint_accept_count", None)
+    if value is None:
+        return None
+    return int(value)
+
+
+def _stricter_rearm_blocked_for_output(output: Any) -> bool:
+    return bool(getattr(output, "stricter_rearm_blocked", False))
+
+
 def _write_events(*, out_dir: str | Path, records: list[ReplayValidationRecord]) -> Path:
     output_dir = Path(out_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1339,6 +1390,9 @@ def _accepted_bar_row(
         "state_metric_value": record.state_metric_value,
         "setup_fingerprint": record.setup_fingerprint,
         "reset_reason": record.reset_reason,
+        "reset_state_id": record.reset_state_id,
+        "bars_since_reset": record.bars_since_reset,
+        "same_fingerprint_accept_count": record.same_fingerprint_accept_count,
         "effective_anchor_ts": _isoformat_or_none(record.effective_anchor_ts),
         "current_session_date": record.current_session_date,
         "actionable_signal_id": actionable_signal_id,

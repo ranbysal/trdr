@@ -1,0 +1,5 @@
+instrument,strategy,setup,strategy_path,actionable_signal_count
+GOLD,strat_gold_signal,primary_mean_reversion,strat_gold_signal/primary_mean_reversion,162
+NQ,strat_nq_signal,structural_continuation,strat_nq_signal/structural_continuation,214
+YM,strat_ym_signal,primary_mean_reversion,strat_ym_signal/primary_mean_reversion,71
+YM,strat_ym_signal,secondary_ema_continuation,strat_ym_signal/secondary_ema_continuation,145
