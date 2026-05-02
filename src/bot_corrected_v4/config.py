@@ -22,6 +22,7 @@ class CorrectedV4Config:
     schema: str
     stype_in: str
     databento_symbols: tuple[str, ...]
+    execution_queue_path: Path
     alert_tag: str
     heartbeat_interval_hours: float
     bars_stale_after_s: float
@@ -104,6 +105,7 @@ def load_corrected_v4_config(config_dir: str | Path) -> CorrectedV4Config:
         schema=str(bot.get("schema", "ohlcv-1m")),
         stype_in=str(bot.get("stype_in", "continuous")),
         databento_symbols=databento_symbols,
+        execution_queue_path=Path(str(runtime.get("execution_queue_path", "out/corrected_v4/execution_events.ndjson"))),
         alert_tag=str(bot.get("alert_tag", "[CORR-V4]")),
         heartbeat_interval_hours=float(runtime.get("heartbeat_interval_hours", 4.0)),
         bars_stale_after_s=float(runtime.get("bars_stale_after_s", 180.0)),

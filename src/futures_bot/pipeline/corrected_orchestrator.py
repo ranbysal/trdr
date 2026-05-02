@@ -96,6 +96,8 @@ class AcceptedSignalOutput:
     stage_events: tuple[StageEvent, ...]
     session_state: InstrumentSessionState
     strategy_candidate: StrategyCandidate
+    entry_price: float
+    stop_price: float
     reset_reason: str | None = None
     reset_state_id: str | None = None
     bars_since_reset: int | None = None
@@ -311,6 +313,8 @@ class CorrectedSignalOrchestrator:
             stage_events=stage_events,
             session_state=session_state,
             instrument=request.instrument,
+            entry_price=data.latest_close,
+            stop_price=min(request.order_block_low, data.ema_slow),
         )
 
     def _evaluate_ym(self, request: YMEvaluationRequest) -> CorrectedOrchestratorOutput:
@@ -413,6 +417,8 @@ class CorrectedSignalOrchestrator:
             stage_events=stage_events,
             session_state=session_state,
             instrument=request.instrument,
+            entry_price=data.latest_close,
+            stop_price=stop_price,
             reset_reason=freshness.reset_reason,
             reset_state_id=freshness.reset_state_id,
             bars_since_reset=freshness.bars_since_reset,
@@ -527,6 +533,8 @@ class CorrectedSignalOrchestrator:
             stage_events=stage_events,
             session_state=session_state,
             instrument=request.instrument,
+            entry_price=data.latest_close,
+            stop_price=stop_price,
             reset_reason=freshness.reset_reason,
             reset_state_id=freshness.reset_state_id,
             bars_since_reset=freshness.bars_since_reset,
@@ -1223,6 +1231,8 @@ class CorrectedSignalOrchestrator:
         stage_events: list[StageEvent],
         session_state: InstrumentSessionState,
         instrument: InstrumentMeta,
+        entry_price: float,
+        stop_price: float,
         reset_reason: str | None = None,
         reset_state_id: str | None = None,
         bars_since_reset: int | None = None,
@@ -1250,6 +1260,8 @@ class CorrectedSignalOrchestrator:
             stage_events=tuple(stage_events),
             session_state=session_state,
             strategy_candidate=strategy_candidate,
+            entry_price=entry_price,
+            stop_price=stop_price,
             reset_reason=reset_reason,
             reset_state_id=reset_state_id,
             bars_since_reset=bars_since_reset,

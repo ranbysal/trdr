@@ -1,0 +1,14 @@
+bot:
+  enabled: true
+  source_queue_path: out/corrected_v4/execution_events.ndjson
+
+storage:
+  state_path: state/corrected_paper/corrected_paper_state.json
+  journal_path: out/corrected_paper/corrected_paper_journal.ndjson
+  events_path: out/corrected_paper/events.ndjson
+  reports_dir: out/corrected_paper/reports
+
+point_values:
+  NQ: 20.0
+  YM: 5.0
+  MGC: 10.0

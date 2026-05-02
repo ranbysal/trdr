@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from bot_corrected_paper.controller import CorrectedPaperCommandController
 from bot_exec_v3.controller import PaperCommandController
 from futures_bot.alerts.eod_summary import EodSummaryManager
 from futures_bot.alerts.error_forwarder import ErrorForwarder
@@ -115,6 +116,7 @@ class LiveSignalRunner:
         self._supervisor_task: asyncio.Task[None] | None = None
         self._listener_task: asyncio.Task[None] | None = None
         self._paper_controller = PaperCommandController()
+        self._corrected_paper_controller = CorrectedPaperCommandController()
         self._engine = MultiStrategySignalEngine(
             out_dir=out_path,
             state_dir=state_path,
@@ -142,9 +144,15 @@ class LiveSignalRunner:
             notifier=self._notifier,
             status_provider=self._status_message,
             set_signals_active=self._set_signals_active,
-            command_handler=self._paper_controller.handle_command,
+            command_handler=self._handle_read_only_command,
             poll_interval_s=float(os.getenv("FUTURES_BOT_TELEGRAM_POLL_INTERVAL_S", "2")),
         )
+
+    def _handle_read_only_command(self, text: str) -> str | None:
+        response = self._paper_controller.handle_command(text)
+        if response is not None:
+            return response
+        return self._corrected_paper_controller.handle_command(text)
 
     async def run(self, *, max_messages: int | None = None, max_runtime_s: float | None = None) -> None:
         try:

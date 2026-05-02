@@ -237,12 +237,25 @@ def test_corrected_v4_live_runner_emits_corrected_orchestrator_signal(tmp_path: 
         json.loads(line)
         for line in (tmp_path / "out" / "live_events.ndjson").read_text(encoding="utf-8").strip().splitlines()
     ]
+    execution_records = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "execution_events.ndjson").read_text(encoding="utf-8").strip().splitlines()
+    ]
 
     assert any(text.startswith("[CORR-V4] SIGNAL") for text in notifier.texts)
     assert any("instrument: NQ" in text for text in notifier.texts)
     assert any("strategy: strat_nq_signal" in text for text in notifier.texts)
+    assert any(record["event"] == "BAR_RECEIVED" and record["symbol"] == "NQ" for record in records)
+    assert any(record["event"] == "SIGNAL_ACCEPTED" and record["symbol"] == "NQ" for record in records)
     assert any(record["event"] == "SIGNAL_EMITTED" and record["symbol"] == "NQ" for record in records)
     assert any(record["event"] == "TELEGRAM_SEND_SUCCESS" and record["strategy"] == "strat_nq_signal" for record in records)
+    signal_record = next(record for record in execution_records if record["event"] == "CORRECTED_EXECUTION_SIGNAL")
+    assert signal_record["paper_only"] is True
+    assert signal_record["symbol"] == "NQ"
+    assert signal_record["entry_price"] > 0.0
+    assert signal_record["stop_price"] > 0.0
+    assert signal_record["tp1_price"] > 0.0
+    assert any(record["event"] == "CORRECTED_MARKET_BAR" and record["symbol"] == "NQ" for record in execution_records)
 
 
 def test_corrected_v4_live_runner_canonicalizes_gold_symbol_across_live_events_and_state(tmp_path: Path) -> None:
@@ -324,12 +337,17 @@ def test_corrected_v4_live_runner_canonicalizes_gold_symbol_across_live_events_a
         json.loads(line)
         for line in (tmp_path / "out" / "live_events.ndjson").read_text(encoding="utf-8").strip().splitlines()
     ]
+    execution_records = [
+        json.loads(line)
+        for line in (tmp_path / "out" / "execution_events.ndjson").read_text(encoding="utf-8").strip().splitlines()
+    ]
     state = json.loads(state_path.read_text(encoding="utf-8"))
 
     assert any(text.startswith("[CORR-V4] SIGNAL") for text in notifier.texts)
     assert any("instrument: MGC" in text for text in notifier.texts)
     assert any(record["event"] == "BAR_RECEIVED" and record["symbol"] == "MGC" for record in records)
     assert any(record["event"] == "SIGNAL_REJECTED" and record["symbol"] == "MGC" for record in records)
+    assert any(record["event"] == "SIGNAL_ACCEPTED" and record["symbol"] == "MGC" for record in records)
     assert any(record["event"] == "SIGNAL_EMITTED" and record["symbol"] == "MGC" for record in records)
     assert any(
         record["event"] == "TELEGRAM_SEND_SUCCESS"
@@ -340,9 +358,14 @@ def test_corrected_v4_live_runner_canonicalizes_gold_symbol_across_live_events_a
     assert all(
         record["symbol"] != "GC"
         for record in records
-        if record["event"] in {"BAR_RECEIVED", "SIGNAL_REJECTED", "SIGNAL_EMITTED", "TELEGRAM_SEND_SUCCESS"}
+        if record["event"]
+        in {"BAR_RECEIVED", "SIGNAL_REJECTED", "SIGNAL_ACCEPTED", "SIGNAL_EMITTED", "TELEGRAM_SEND_SUCCESS"}
     )
     assert set(state["last_bar_by_symbol"]) == {"MGC"}
     assert set(state["last_signal_keys"]) == {"MGC"}
     assert set(state["stale_alert_active_flags"]) == {"bar:MGC"}
     assert state["open_positions"][0]["symbol"] == "MGC"
+    assert any(
+        record["event"] == "CORRECTED_EXECUTION_SIGNAL" and record["symbol"] == "MGC"
+        for record in execution_records
+    )

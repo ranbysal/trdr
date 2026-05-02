@@ -10,6 +10,7 @@ bot:
   gold_symbol: MGC
 
 runtime:
+  execution_queue_path: out/corrected_v4/execution_events.ndjson
   databento_symbols:
     - NQ.v.0
     - YM.v.0

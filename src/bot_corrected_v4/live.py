@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -76,6 +77,13 @@ class CorrectedV4LiveRunner:
         }
         self._events_log_path = self._out_dir / "live_events.ndjson"
         self._events_log = NdjsonWriter(self._events_log_path)
+        self._execution_queue_path = (
+            config.execution_queue_path
+            if config.execution_queue_path.is_absolute()
+            else self._out_dir / config.execution_queue_path.name
+        )
+        self._execution_queue_path.parent.mkdir(parents=True, exist_ok=True)
+        self._execution_queue = NdjsonWriter(self._execution_queue_path)
         self._state_store = JsonStateStore(self._state_dir / "corrected_v4_live_state.json")
         restored = self._state_store.load()
         self._signals_active = bool(restored.get("signals_active", True))
@@ -156,6 +164,7 @@ class CorrectedV4LiveRunner:
             await self._client.stop()
             self._save_state()
             self._events_log.flush()
+            self._execution_queue.flush()
 
     async def _maintenance_loop(self) -> None:
         while True:
@@ -187,6 +196,11 @@ class CorrectedV4LiveRunner:
             symbol=canonical_symbol,
             strategy="runtime",
             reason_code=None,
+        )
+        self._write_execution_bar_event(
+            timestamp_et=message.timestamp_et,
+            symbol=canonical_symbol,
+            payload=message.payload,
         )
 
         instrument = _resolve_live_instrument(
@@ -283,6 +297,10 @@ class CorrectedV4LiveRunner:
             )
             return
 
+        # Emit the standard accepted signal event name while keeping the
+        # existing alias for any downstream CORR-V4 consumers already using it.
+        self._write_signal_event(event="SIGNAL_ACCEPTED", output=output)
+        self._write_execution_signal_event(output=output, instrument=instrument)
         self._write_signal_event(event="SIGNAL_EMITTED", output=output)
         delivery = self._notifier.send_text(text=_format_signal_message(output))
         self._write_telegram_event(
@@ -441,6 +459,65 @@ class CorrectedV4LiveRunner:
             detail=detail,
             score=output.signal.score,
             contracts=output.sizing.contracts,
+        )
+
+    def _write_execution_signal_event(self, *, output: AcceptedSignalOutput, instrument: InstrumentMeta) -> None:
+        signal = output.signal
+        direction = "LONG" if signal.side is OrderSide.BUY else "SHORT"
+        risk_per_contract = abs(output.entry_price - output.stop_price) * instrument.point_value
+        tp1_price = (
+            output.entry_price + abs(output.entry_price - output.stop_price)
+            if direction == "LONG"
+            else output.entry_price - abs(output.entry_price - output.stop_price)
+        )
+        self._execution_queue.write(
+            {
+                "event": "CORRECTED_EXECUTION_SIGNAL",
+                "paper_only": True,
+                "source": "CORR-V4",
+                "signal_id": _build_corrected_execution_signal_id(
+                    symbol=signal.symbol,
+                    strategy=signal.strategy.value,
+                    direction=direction,
+                    timestamp_et=signal.ts.astimezone(ET),
+                    entry_price=output.entry_price,
+                    stop_price=output.stop_price,
+                ),
+                "timestamp_et": signal.ts.astimezone(ET).isoformat(),
+                "symbol": signal.symbol,
+                "strategy": signal.strategy.value,
+                "setup": output.candidate.setup.value,
+                "direction": direction,
+                "score": signal.score,
+                "contracts": output.sizing.contracts,
+                "point_value": instrument.point_value,
+                "entry_price": output.entry_price,
+                "stop_price": output.stop_price,
+                "tp1_price": tp1_price,
+                "risk_dollars": output.sizing.risk_dollars,
+                "risk_per_contract": risk_per_contract,
+                "routed_symbol": output.sizing.routed_symbol,
+            }
+        )
+
+    def _write_execution_bar_event(
+        self,
+        *,
+        timestamp_et: datetime,
+        symbol: str,
+        payload: dict[str, object],
+    ) -> None:
+        self._execution_queue.write(
+            {
+                "event": "CORRECTED_MARKET_BAR",
+                "timestamp_et": timestamp_et.isoformat(),
+                "symbol": symbol,
+                "open": float(payload["open"]),
+                "high": float(payload["high"]),
+                "low": float(payload["low"]),
+                "close": float(payload["close"]),
+                "volume": float(payload["volume"]),
+            }
         )
 
     def _write_event(
@@ -746,3 +823,26 @@ def _format_signal_message(output: AcceptedSignalOutput) -> str:
             f"signal_ts: {signal.ts.astimezone(ET).isoformat()}",
         ]
     )
+
+
+def _build_corrected_execution_signal_id(
+    *,
+    symbol: str,
+    strategy: str,
+    direction: str,
+    timestamp_et: datetime,
+    entry_price: float,
+    stop_price: float,
+) -> str:
+    material = "|".join(
+        [
+            symbol.strip().upper(),
+            strategy.strip().lower(),
+            direction.strip().upper(),
+            timestamp_et.isoformat(),
+            f"{entry_price:.8f}",
+            f"{stop_price:.8f}",
+        ]
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:20]
+    return f"corr-v4-{digest}"
