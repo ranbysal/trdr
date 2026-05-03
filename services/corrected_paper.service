@@ -5,14 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/trdr
+WorkingDirectory=/srv/trdr
 Environment=BOT_ALERT_TAG=[CORR-PAPER]
-ExecStartPre=/usr/bin/mkdir -p /opt/trdr/out/corrected_paper/logs /opt/trdr/out/corrected_paper/reports /opt/trdr/state/corrected_paper
-ExecStart=/usr/bin/env bash /opt/trdr/scripts/run_corrected_paper.sh
+ExecStartPre=/usr/bin/mkdir -p /srv/trdr/out/corrected_paper/logs /srv/trdr/out/corrected_paper/reports /srv/trdr/state/corrected_paper
+ExecStart=/usr/bin/env bash /srv/trdr/scripts/run_corrected_paper.sh
 Restart=always
 RestartSec=5
-StandardOutput=append:/opt/trdr/out/corrected_paper/logs/systemd_stdout.log
-StandardError=append:/opt/trdr/out/corrected_paper/logs/systemd_stderr.log
+StandardOutput=append:/srv/trdr/out/corrected_paper/logs/systemd_stdout.log
+StandardError=append:/srv/trdr/out/corrected_paper/logs/systemd_stderr.log
 
 [Install]
 WantedBy=multi-user.target

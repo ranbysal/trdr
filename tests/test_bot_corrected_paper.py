@@ -226,18 +226,29 @@ def test_corrected_paper_vps_artifacts_are_present() -> None:
     assert deployer.exists()
     assert verifier.exists()
     assert runbook.exists()
-    assert "corrected-paper\" watch" in launcher.read_text(encoding="utf-8")
+    launcher_text = launcher.read_text(encoding="utf-8")
+    assert 'cd "${TRDR_HOME:-/srv/trdr}"' in launcher_text
+    assert "corrected-paper\" watch" in launcher_text
     deployer_text = deployer.read_text(encoding="utf-8")
-    assert "VPS_TARGET is required" in deployer_text
+    assert "TRDR_REMOTE_DIR:-/srv/trdr" in deployer_text
+    assert "nohup scripts/run_corrected_paper.sh" in deployer_text
     assert "scripts/verify_corrected_paper_vps.sh" in deployer_text
     verifier_text = verifier.read_text(encoding="utf-8")
-    assert "systemctl is-active" in verifier_text
+    assert 'cd "${TRDR_HOME:-/srv/trdr}"' in verifier_text
+    assert "kill -0" in verifier_text
+    assert "run_corrected_paper.sh" in verifier_text
+    assert "systemctl" not in verifier_text
     assert "out/corrected_paper/reports/summary.json" in verifier_text
     assert "/corrected_paper_pnl" in verifier_text
     assert "CorrectedPaperCommandController" in verifier_text
+    runbook_text = runbook.read_text(encoding="utf-8")
+    assert "TRDR_HOME=/srv/trdr scripts/deploy_corrected_paper_vps.sh" in runbook_text
+    assert "startup-script" in runbook_text
+    assert "sudo " not in runbook_text
+    assert "systemctl" not in runbook_text
     service_text = service.read_text(encoding="utf-8")
     assert "Restart=always" in service_text
-    assert "out/corrected_paper/logs/systemd_stdout.log" in service_text
+    assert "WorkingDirectory=/srv/trdr" in service_text
 
 
 def test_corrected_paper_config_defaults() -> None:

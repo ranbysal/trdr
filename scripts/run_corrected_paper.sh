@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "${TRDR_HOME:-/opt/trdr}"
+cd "${TRDR_HOME:-/srv/trdr}"
+
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
 
 mkdir -p out/corrected_paper/logs out/corrected_paper/reports state/corrected_paper
 
